@@ -10,6 +10,8 @@ pub struct SearchRequest {
     pub query: QueryClause,
     #[serde(default = "default_size")]
     pub size: usize,
+    #[serde(default)]
+    pub from: usize,
 }
 
 fn default_size() -> usize {
@@ -80,6 +82,19 @@ mod tests {
         });
         let req: SearchRequest = serde_json::from_value(body).unwrap();
         assert_eq!(req.size, 10);
+        assert_eq!(req.from, 0);
+    }
+
+    #[test]
+    fn from_and_size_from_json() {
+        let body = json!({
+            "query": { "match_all": {} },
+            "from": 20,
+            "size": 5
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.from, 20);
+        assert_eq!(req.size, 5);
     }
 
     #[test]
@@ -87,10 +102,12 @@ mod tests {
         let req = SearchRequest {
             query: QueryClause::MatchAll(json!({})),
             size: 20,
+            from: 5,
         };
         let json_str = serde_json::to_string(&req).unwrap();
         let req2: SearchRequest = serde_json::from_str(&json_str).unwrap();
         assert_eq!(req2.size, 20);
+        assert_eq!(req2.from, 5);
         assert!(matches!(req2.query, QueryClause::MatchAll(_)));
     }
 }

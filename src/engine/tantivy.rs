@@ -189,9 +189,11 @@ impl HotEngine {
         });
     }
 
-    /// Shared search execution helper — returns _id + _source from each hit
-    fn execute_search(&self, searcher: tantivy::Searcher, query: &dyn tantivy::query::Query) -> Result<Vec<serde_json::Value>> {
-        let top_docs = searcher.search(query, &TopDocs::with_limit(10))?;
+    /// Shared search execution helper — returns _id + _source from each hit.
+    /// `limit` controls how many top docs Tantivy collects.
+    fn execute_search(&self, searcher: tantivy::Searcher, query: &dyn tantivy::query::Query, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let effective_limit = if limit == 0 { 1 } else { limit };
+        let top_docs = searcher.search(query, &TopDocs::with_limit(effective_limit))?;
         let registry = self.field_registry.read()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -326,7 +328,7 @@ impl super::SearchEngine for HotEngine {
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![body_field]);
         let query = query_parser.parse_query(query_str)?;
-        self.execute_search(searcher, &*query)
+        self.execute_search(searcher, &*query, 100)
     }
 
     fn search_query(&self, req: &crate::search::SearchRequest) -> Result<Vec<serde_json::Value>> {
@@ -335,11 +337,12 @@ impl super::SearchEngine for HotEngine {
         use tantivy::schema::IndexRecordOption;
         use tantivy::Term;
 
+        let limit = std::cmp::max(req.from + req.size, 100);
         let searcher = self.reader.searcher();
 
         match &req.query {
             QueryClause::MatchAll(_) => {
-                self.execute_search(searcher, &AllQuery)
+                self.execute_search(searcher, &AllQuery, limit)
             }
             QueryClause::Match(fields) => {
                 if let Some((field_name, value)) = fields.iter().next() {
@@ -350,7 +353,7 @@ impl super::SearchEngine for HotEngine {
                     let target_field = self.resolve_field(field_name);
                     let query_parser = QueryParser::for_index(&self.index, vec![target_field]);
                     let query = query_parser.parse_query(&query_str)?;
-                    self.execute_search(searcher, &*query)
+                    self.execute_search(searcher, &*query, limit)
                 } else {
                     Ok(vec![])
                 }
@@ -364,7 +367,7 @@ impl super::SearchEngine for HotEngine {
                     let target_field = self.resolve_field(field_name);
                     let term = Term::from_field_text(target_field, &term_str);
                     let query = TermQuery::new(term, IndexRecordOption::Basic);
-                    self.execute_search(searcher, &query)
+                    self.execute_search(searcher, &query, limit)
                 } else {
                     Ok(vec![])
                 }
@@ -484,6 +487,7 @@ mod tests {
         let req = SearchRequest {
             query: QueryClause::MatchAll(json!({})),
             size: 10,
+            from: 0,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
@@ -501,6 +505,7 @@ mod tests {
         let req = SearchRequest {
             query: QueryClause::Match(fields),
             size: 10,
+            from: 0,
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
@@ -583,5 +588,92 @@ mod tests {
         engine.delete_document("a").unwrap();
         engine.refresh().unwrap();
         assert_eq!(engine.doc_count(), 1);
+    }
+
+    // ── from/size pagination ────────────────────────────────────────────
+
+    #[test]
+    fn search_query_respects_size() {
+        let (_dir, engine) = create_engine();
+        for i in 0..20 {
+            engine.add_document(&format!("doc-{}", i), json!({"title": "hello world"})).unwrap();
+        }
+        engine.refresh().unwrap();
+
+        // Engine fetches max(from+size, 100) hits; coordinator does the slicing.
+        // With 20 docs and limit=max(5,100)=100, engine returns all 20.
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 5,
+            from: 0,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 20, "engine returns all matching docs for coordinator to slice");
+    }
+
+    #[test]
+    fn search_query_from_skips_results() {
+        let (_dir, engine) = create_engine();
+        for i in 0..10 {
+            engine.add_document(&format!("doc-{}", i), json!({"title": "hello world"})).unwrap();
+        }
+        engine.refresh().unwrap();
+
+        // Engine always fetches max(from+size, 100) — returns all 10
+        let req_all = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+        };
+        let all_results = engine.search_query(&req_all).unwrap();
+        assert_eq!(all_results.len(), 10);
+
+        // from=7, size=10 → engine fetches max(17,100)=100, returns all 10
+        let req_paged = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 7,
+        };
+        let paged_results = engine.search_query(&req_paged).unwrap();
+        assert_eq!(paged_results.len(), 10, "engine returns all available hits; coordinator slices");
+    }
+
+    #[test]
+    fn search_query_from_beyond_total_returns_all_available() {
+        let (_dir, engine) = create_engine();
+        for i in 0..5 {
+            engine.add_document(&format!("doc-{}", i), json!({"title": "test"})).unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 100,
+        };
+        let results = engine.search_query(&req).unwrap();
+        assert_eq!(results.len(), 5, "engine returns all 5 hits; coordinator will slice to empty");
+    }
+
+    #[test]
+    fn pagination_total_is_accurate_after_coordinator_slice() {
+        // Simulates what the API coordinator does: collect all engine hits,
+        // report total from full set, then slice with from/size.
+        let (_dir, engine) = create_engine();
+        for i in 0..15 {
+            engine.add_document(&format!("doc-{}", i), json!({"title": "hello"})).unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let req = crate::search::SearchRequest {
+            query: crate::search::QueryClause::MatchAll(json!({})),
+            size: 5,
+            from: 0,
+        };
+        let all_hits = engine.search_query(&req).unwrap();
+        let total = all_hits.len(); // This is what hits.total.value should be
+        let paginated: Vec<_> = all_hits.into_iter().skip(req.from).take(req.size).collect();
+        assert_eq!(total, 15, "total should reflect all matching docs");
+        assert_eq!(paginated.len(), 5, "paginated should have size hits");
     }
 }

@@ -12,10 +12,18 @@ use futures::future::join_all;
 pub struct SearchParams {
     #[serde(default = "default_query")]
     q: String,
+    #[serde(default = "default_size")]
+    size: usize,
+    #[serde(default)]
+    from: usize,
 }
 
 fn default_query() -> String {
     "*".to_string()
+}
+
+fn default_size() -> usize {
+    10
 }
 
 /// GET /{index}/_search?q=... — query-string search across all shards (local + remote) for this index.
@@ -106,6 +114,18 @@ pub async fn search_documents(
         }
     }
 
+    // Sort by _score descending, then apply from/size pagination
+    all_hits.sort_by(|a, b| {
+        let sa = a.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sb = b.get("_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let total = all_hits.len();
+    let from = params.from;
+    let size = params.size;
+    let paginated: Vec<_> = all_hits.into_iter().skip(from).take(size).collect();
+
     (StatusCode::OK, Json(serde_json::json!({
         "_shards": {
             "total": successful_shards + failed_shards,
@@ -113,8 +133,8 @@ pub async fn search_documents(
             "failed": failed_shards
         },
         "hits": {
-            "total": { "value": all_hits.len(), "relation": "eq" },
-            "hits": all_hits
+            "total": { "value": total, "relation": "eq" },
+            "hits": paginated
         }
     })))
 }
