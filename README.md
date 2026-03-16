@@ -168,8 +168,8 @@ Document writes use direct primary-to-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All 159 tests
-cargo test --lib                                # Unit tests (133)
+cargo test                                      # All 164 tests
+cargo test --lib                                # Unit tests (138)
 cargo test --test consensus_integration          # Raft consensus tests (15)
 cargo test --test replication_integration        # Replication tests (11)
 ```
@@ -199,7 +199,7 @@ config/            Default configuration
 ## Roadmap
 
 ### Search & Query
-- [ ] Pagination support (`from` / `size` parameters)
+- [x] Pagination support (`from` / `size` parameters)
 - [ ] Sort by field and `_score`
 - [ ] Bool queries (`must`, `should`, `must_not`, `filter`)
 - [ ] Range queries (`gt`, `gte`, `lt`, `lte`)
