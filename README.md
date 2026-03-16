@@ -35,6 +35,15 @@ Then query the basic API:
 curl http://localhost:9200/
 ```
 
+Try to index a doc using
+```
+curl -X POST http://localhost:9200/my-index/_doc   -H "Content-Type: application/json"   -d '{"title": "Tantivy is the engine", "tags": "rust search"}'
+```
+Search it using
+```
+curl "http://localhost:9200/my-index/_search?q=rust"
+```
+
 ## Roadmap
 - [ ] Implement OpenSearch-compatible index mapping APIs
 - [ ] Distributed shard allocation and rebalancing
