@@ -74,3 +74,21 @@ When implementing any feature or fix:
 7. **Coverage audit** — check every branch in new code has a test; add missing ones
 8. **Update README** — examples, roadmap checkmarks, test counts
 9. **Update copilot-instructions.md** — if architecture or conventions changed
+
+## Vector Search Plan (0.1.0)
+Uses USearch (C++ with Rust bindings) for HNSW-based approximate nearest neighbor search.
+
+Architecture per shard:
+- Tantivy index — full-text (inverted index, BM25)
+- USearch index — vector (HNSW graph, cosine/L2/IP)
+- WAL — crash recovery for both
+
+Implementation phases:
+1. **Foundation** — Add usearch dep, create VectorIndex wrapper, knn_vector field type in mappings, index/search vectors on single shard
+2. **Distribution** — Wire into shard manager, scatter-gather for knn across shards, gRPC forwarding for vector queries
+3. **Hybrid search** — Combine BM25 + vector similarity scores in one query, from/size, pre-filtering with bool/range
+
+API (OpenSearch k-NN compatible):
+- Index: `PUT /my-index/_doc/1` with `{"embedding": [0.1, 0.2, ...], "title": "..."}`
+- Search: `POST /my-index/_search` with `{"knn": {"embedding": {"vector": [0.1, ...], "k": 10}}}`
+- Hybrid: `{"query": {"match": ...}, "knn": {"embedding": {...}}}`

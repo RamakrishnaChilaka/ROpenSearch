@@ -256,6 +256,18 @@ config/            Default configuration
 - [x] Return `_score` in search results
 - [ ] Aggregations (terms, histogram, stats)
 
+### Vector Search (k-NN)
+- [ ] USearch integration for HNSW-based approximate nearest neighbor search
+- [ ] `knn_vector` field type in index mappings
+- [ ] Index vectors alongside documents (`PUT /_doc` with embedding field)
+- [ ] k-NN search API (`POST /_search` with `knn` clause)
+- [ ] Distance metrics: cosine, L2 (euclidean), inner product
+- [ ] Hybrid search: combine BM25 full-text scores + vector similarity in one query
+- [ ] k-NN across shards (scatter-gather for vector queries)
+- [ ] Quantization support (f16, i8) for memory efficiency
+- [ ] Disk-backed vector indexes (mmap via USearch)
+- [ ] Pre-filtering: apply bool/range filters before vector search
+
 ### Index Management
 - [ ] Field mappings in `PUT /{index}` (explicit schema definition)
 - [ ] Dynamic vs. strict mapping modes
