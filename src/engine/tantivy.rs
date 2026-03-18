@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
@@ -269,6 +269,15 @@ impl HotEngine {
     ) -> Result<Vec<serde_json::Value>> {
         let effective_limit = if limit == 0 { 1 } else { limit };
         let top_docs = searcher.search(query, &TopDocs::with_limit(effective_limit))?;
+        self.collect_hits(&searcher, top_docs)
+    }
+
+    /// Extract _id, _score, _source from pre-collected top docs.
+    fn collect_hits(
+        &self,
+        searcher: &tantivy::Searcher,
+        top_docs: Vec<(f32, tantivy::DocAddress)>,
+    ) -> Result<Vec<serde_json::Value>> {
         let registry = self
             .field_registry
             .read()
@@ -653,11 +662,18 @@ impl super::SearchEngine for HotEngine {
         self.execute_search(searcher, &*query, 100)
     }
 
-    fn search_query(&self, req: &crate::search::SearchRequest) -> Result<Vec<serde_json::Value>> {
+    fn search_query(
+        &self,
+        req: &crate::search::SearchRequest,
+    ) -> Result<(Vec<serde_json::Value>, usize)> {
         let limit = std::cmp::max(req.from + req.size, 100);
         let searcher = self.reader.searcher();
         let query = self.build_query(&req.query)?;
-        self.execute_search(searcher, &*query, limit)
+        let effective_limit = if limit == 0 { 1 } else { limit };
+        let (top_docs, total) =
+            searcher.search(&*query, &(TopDocs::with_limit(effective_limit), Count))?;
+        let hits = self.collect_hits(&searcher, top_docs)?;
+        Ok((hits, total))
     }
 
     fn doc_count(&self) -> u64 {
@@ -787,8 +803,67 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, total) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn search_query_total_count_exceeds_limit() {
+        let (_dir, engine) = create_engine();
+        // Insert 200 docs — more than the default limit of 100
+        for i in 0..200 {
+            engine
+                .add_document(&format!("doc-{}", i), json!({"val": i}))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        // With size=0, only 100 hits are collected, but total should be 200
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 0,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (results, total) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 200, "total should count all matching docs");
+        assert!(
+            results.len() <= 100,
+            "hits should be limited by max(from+size, 100)"
+        );
+    }
+
+    #[test]
+    fn search_query_total_with_filter() {
+        let (_dir, engine) = create_engine();
+        for i in 0..50 {
+            engine
+                .add_document(&format!("d{}", i), json!({"body": "matching term"}))
+                .unwrap();
+        }
+        for i in 50..100 {
+            engine
+                .add_document(&format!("d{}", i), json!({"body": "other content"}))
+                .unwrap();
+        }
+        engine.refresh().unwrap();
+
+        let mut fields = HashMap::new();
+        fields.insert("body".to_string(), json!("matching"));
+        let req = SearchRequest {
+            query: QueryClause::Match(fields),
+            size: 5,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (results, total) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 50, "total should count all matching docs");
+        assert!(results.len() <= 100);
     }
 
     #[test]
@@ -812,7 +887,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["_id"], "d1");
     }
@@ -929,7 +1004,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             20,
@@ -956,7 +1031,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let all_results = engine.search_query(&req_all).unwrap();
+        let (all_results, _) = engine.search_query(&req_all).unwrap();
         assert_eq!(all_results.len(), 10);
 
         // from=7, size=10 → engine fetches max(17,100)=100, returns all 10
@@ -968,7 +1043,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let paged_results = engine.search_query(&req_paged).unwrap();
+        let (paged_results, _) = engine.search_query(&req_paged).unwrap();
         assert_eq!(
             paged_results.len(),
             10,
@@ -994,7 +1069,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             5,
@@ -1022,7 +1097,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let all_hits = engine.search_query(&req).unwrap();
+        let (all_hits, _) = engine.search_query(&req).unwrap();
         let total = all_hits.len(); // This is what hits.total.value should be
         let paginated: Vec<_> = all_hits.into_iter().skip(req.from).take(req.size).collect();
         assert_eq!(total, 15, "total should reflect all matching docs");
@@ -1060,7 +1135,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "must:rust should match d1 and d3");
     }
 
@@ -1094,7 +1169,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "must_not:python should exclude d2");
     }
 
@@ -1134,7 +1209,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -1168,7 +1243,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1, "filter:rust should match only d1");
     }
 
@@ -1187,7 +1262,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty bool should match all docs");
     }
 
@@ -1226,7 +1301,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -1284,7 +1359,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -1313,7 +1388,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -1341,7 +1416,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2, "empty Term should fall back to match all");
     }
 
@@ -1369,7 +1444,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -1402,7 +1477,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["_id"], "d1");
     }
@@ -1439,7 +1514,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d2"), "bob should match");
@@ -1474,7 +1549,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d2"), "bob should match");
         assert!(ids.contains(&"d3"), "charlie should match");
@@ -1499,7 +1574,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -1548,7 +1623,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["_id"], "d1");
     }
@@ -1581,7 +1656,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 2);
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d1"));
@@ -1610,7 +1685,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d1"), "rust should match r?st");
         assert!(ids.contains(&"d2"), "rest should match r?st");
@@ -1643,7 +1718,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d1"), "search should match prefix 'sea'");
         assert!(ids.contains(&"d2"), "sea should match prefix 'sea'");
@@ -1667,7 +1742,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1685,7 +1760,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1718,7 +1793,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0]["_id"], "d1",
@@ -1750,7 +1825,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert!(results.is_empty(), "fuzziness 0 should be exact match only");
     }
 
@@ -1768,7 +1843,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1817,7 +1892,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let hits = engine.search_query(&req).unwrap();
+        let (hits, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d1");
     }
@@ -1855,7 +1930,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let hits = engine.search_query(&req).unwrap();
+        let (hits, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d1");
     }
@@ -1904,7 +1979,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let hits = engine.search_query(&req).unwrap();
+        let (hits, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 2, "year >= 2010 should match d2 and d3");
         let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"d2"));
@@ -1952,7 +2027,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let hits = engine.search_query(&req).unwrap();
+        let (hits, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["_id"], "d2");
     }
@@ -2101,5 +2176,139 @@ mod tests {
         // Docs still searchable (committed)
         engine.refresh().unwrap();
         assert_eq!(engine.doc_count(), 2);
+    }
+
+    // ── refresh visibility ──────────────────────────────────────────────
+
+    #[test]
+    fn docs_not_visible_before_refresh() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("d1", json!({"title": "invisible"}))
+            .unwrap();
+
+        // No refresh — doc should NOT be searchable
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 0, "docs must not be visible before refresh");
+        assert!(hits.is_empty());
+
+        // get_document should also return None (not committed)
+        let doc = engine.get_document("d1").unwrap();
+        assert!(doc.is_none(), "get_document must not find uncommitted doc");
+    }
+
+    #[test]
+    fn docs_visible_after_refresh() {
+        let (_dir, engine) = create_engine();
+        engine
+            .add_document("d1", json!({"title": "now visible"}))
+            .unwrap();
+        engine
+            .add_document("d2", json!({"title": "also visible"}))
+            .unwrap();
+
+        // Refresh commits + reloads reader
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(engine.doc_count(), 2);
+    }
+
+    #[test]
+    fn bulk_docs_not_visible_before_refresh() {
+        let (_dir, engine) = create_engine();
+        let docs: Vec<(String, serde_json::Value)> = (0..50)
+            .map(|i| (format!("b{}", i), json!({"val": i})))
+            .collect();
+        engine.bulk_add_documents(docs).unwrap();
+
+        // No refresh — none should be searchable
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(total, 0, "bulk docs must not be visible before refresh");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn bulk_docs_visible_after_refresh() {
+        let (_dir, engine) = create_engine();
+        let docs: Vec<(String, serde_json::Value)> = (0..50)
+            .map(|i| (format!("b{}", i), json!({"val": i})))
+            .collect();
+        engine.bulk_add_documents(docs).unwrap();
+
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::MatchAll(json!({})),
+            size: 10,
+            from: 0,
+            knn: None,
+            sort: vec![],
+            aggs: std::collections::HashMap::new(),
+        };
+        let (hits, total) = engine.search_query(&req).unwrap();
+        assert_eq!(
+            total, 50,
+            "all 50 bulk docs should be visible after refresh"
+        );
+        assert_eq!(hits.len(), 50, "all 50 returned since under internal limit");
+        assert_eq!(engine.doc_count(), 50);
+    }
+
+    #[test]
+    fn incremental_refresh_visibility() {
+        let (_dir, engine) = create_engine();
+
+        // Batch 1: add + refresh
+        engine.add_document("a1", json!({"x": 1})).unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 1);
+
+        // Batch 2: add without refresh — old docs still visible, new ones not
+        engine.add_document("a2", json!({"x": 2})).unwrap();
+        assert_eq!(engine.doc_count(), 1, "a2 not visible until refresh");
+
+        // Refresh again — both visible
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 2);
+    }
+
+    #[test]
+    fn refresh_idempotent() {
+        let (_dir, engine) = create_engine();
+        engine.add_document("d1", json!({"x": 1})).unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 1);
+
+        // Multiple refreshes with no new writes should be fine
+        engine.refresh().unwrap();
+        engine.refresh().unwrap();
+        assert_eq!(engine.doc_count(), 1);
     }
 }

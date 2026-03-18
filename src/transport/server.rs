@@ -476,6 +476,7 @@ impl InternalTransport for TransportService {
                     success: false,
                     hits: vec![],
                     error: "Shard not found on this node".into(),
+                    total_hits: 0,
                 }));
             }
         };
@@ -490,11 +491,13 @@ impl InternalTransport for TransportService {
                     })
                     .collect(),
                 error: String::new(),
+                total_hits: 0,
             })),
             Err(e) => Ok(Response::new(ShardSearchResponse {
                 success: false,
                 hits: vec![],
                 error: e.to_string(),
+                total_hits: 0,
             })),
         }
     }
@@ -511,6 +514,7 @@ impl InternalTransport for TransportService {
                     success: false,
                     hits: vec![],
                     error: "Shard not found on this node".into(),
+                    total_hits: 0,
                 }));
             }
         };
@@ -521,15 +525,20 @@ impl InternalTransport for TransportService {
             })?;
 
         let mut all_hits = Vec::new();
+        let mut total_hits: usize = 0;
 
         // Text / DSL search
         match engine.search_query(&search_req) {
-            Ok(hits) => all_hits.extend(hits),
+            Ok((hits, total)) => {
+                total_hits += total;
+                all_hits.extend(hits);
+            }
             Err(e) => {
                 return Ok(Response::new(ShardSearchResponse {
                     success: false,
                     hits: vec![],
                     error: e.to_string(),
+                    total_hits: 0,
                 }));
             }
         }
@@ -561,6 +570,7 @@ impl InternalTransport for TransportService {
                 })
                 .collect(),
             error: String::new(),
+            total_hits: total_hits as u64,
         }))
     }
 

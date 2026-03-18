@@ -16,7 +16,7 @@ use axum::{
     http::{Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, head, post, put},
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -121,6 +121,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/_cat/indices", get(cat::cat_indices))
         .route("/_cat/master", get(cat::cat_master))
         // Index management
+        .route("/{index}", head(index::index_exists))
         .route("/{index}", put(index::create_index))
         .route("/{index}", delete(index::delete_index))
         // Document operations
@@ -129,12 +130,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{index}/_doc/{id}", get(index::get_document))
         .route("/{index}/_doc/{id}", delete(index::delete_document))
         .route("/{index}/_update/{id}", post(index::update_document))
+        .route("/_bulk", post(index::bulk_index_global))
         .route("/{index}/_bulk", post(index::bulk_index))
         // Search
         .route("/{index}/_search", get(search::search_documents))
         .route("/{index}/_search", post(index::search_documents_dsl))
         // Maintenance
         .route("/{index}/_refresh", post(index::refresh_index))
+        .route("/{index}/_refresh", get(index::refresh_index))
         .route("/{index}/_flush", post(index::flush_index))
         .layer(middleware::from_fn(pretty_json_middleware))
         .with_state(state)

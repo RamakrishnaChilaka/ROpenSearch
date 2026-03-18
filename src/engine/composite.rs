@@ -155,7 +155,7 @@ impl CompositeEngine {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let docs = self.text.search_query(&req).unwrap_or_default();
+        let (docs, _) = self.text.search_query(&req).unwrap_or_default();
         if docs.is_empty() {
             return Ok(());
         }
@@ -236,7 +236,10 @@ impl SearchEngine for CompositeEngine {
         self.text.search(query_str)
     }
 
-    fn search_query(&self, req: &crate::search::SearchRequest) -> Result<Vec<serde_json::Value>> {
+    fn search_query(
+        &self,
+        req: &crate::search::SearchRequest,
+    ) -> Result<(Vec<serde_json::Value>, usize)> {
         self.text.search_query(req)
     }
 
@@ -403,7 +406,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let results = engine.search_query(&req).unwrap();
+        let (results, _) = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -678,7 +681,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let text_hits = engine.search_query(&req).unwrap();
+        let (text_hits, _) = engine.search_query(&req).unwrap();
         assert_eq!(text_hits.len(), 3, "match_all should return all 3 docs");
 
         // kNN search: vector closest to [1.0, 0.0, 0.0] should be d1
@@ -719,7 +722,7 @@ mod tests {
             sort: vec![],
             aggs: std::collections::HashMap::new(),
         };
-        let hits = engine.search_query(&req).unwrap();
+        let (hits, _) = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 2, "match on 'movie' should find d1 and d2");
     }
 
