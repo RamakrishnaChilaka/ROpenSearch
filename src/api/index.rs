@@ -549,13 +549,31 @@ pub async fn search_documents_dsl(
     // Apply user-specified sort (or default _score desc)
     crate::search::sort_hits(&mut all_hits, &search_req.sort);
 
+    // Compute aggregations across all hits (coordinator-level)
+    let aggregations = if !search_req.aggs.is_empty() {
+        crate::search::compute_aggregations(&all_hits, &search_req.aggs)
+    } else {
+        std::collections::HashMap::new()
+    };
+    // For multi-shard, merge partial results (here we compute once from all gathered hits)
+    let merged_aggs = if !aggregations.is_empty() {
+        crate::search::merge_aggregations(vec![aggregations], &search_req.aggs)
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let total = all_hits.len();
     let paginated: Vec<_> = all_hits.into_iter().skip(search_req.from).take(search_req.size).collect();
 
-    (StatusCode::OK, Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "_shards": { "total": successful + failed, "successful": successful, "failed": failed },
         "hits": { "total": { "value": total, "relation": "eq" }, "hits": paginated }
-    })))
+    });
+    if !merged_aggs.is_empty() {
+        response["aggregations"] = serde_json::json!(merged_aggs);
+    }
+
+    (StatusCode::OK, Json(response))
 }
 
 /// GET /{index}/_doc/{id} — Retrieve a document by its ID.

@@ -138,6 +138,7 @@ impl CompositeEngine {
             from: 0,
             knn: None,
             sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let docs = self.text.search_query(&req).unwrap_or_default();
         if docs.is_empty() {
@@ -347,6 +348,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
@@ -556,6 +558,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let text_hits = engine.search_query(&req).unwrap();
         assert_eq!(text_hits.len(), 3, "match_all should return all 3 docs");
@@ -590,6 +593,7 @@ mod tests {
             from: 0,
             knn: None,
             sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let hits = engine.search_query(&req).unwrap();
         assert_eq!(hits.len(), 2, "match on 'movie' should find d1 and d2");

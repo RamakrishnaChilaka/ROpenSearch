@@ -252,6 +252,58 @@ curl -X POST 'http://localhost:9200/my-index/_search' \
 
 Default sort (no `sort` clause) is by `_score` descending. Nulls sort last.
 
+### Aggregations
+
+```bash
+# Terms aggregation: top genres
+curl -X POST 'http://localhost:9200/movies/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {"match_all": {}},
+    "size": 0,
+    "aggs": {
+      "genres": {"terms": {"field": "genre", "size": 10}}
+    }
+  }'
+
+# Stats aggregation: min/max/avg/sum/count
+curl -X POST 'http://localhost:9200/movies/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {"match_all": {}},
+    "size": 0,
+    "aggs": {
+      "rating_stats": {"stats": {"field": "rating"}}
+    }
+  }'
+
+# Histogram: group by decade
+curl -X POST 'http://localhost:9200/movies/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {"match_all": {}},
+    "size": 0,
+    "aggs": {
+      "by_decade": {"histogram": {"field": "year", "interval": 10}}
+    }
+  }'
+
+# Multiple aggregations + filtered query
+curl -X POST 'http://localhost:9200/movies/_search' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {"match": {"genre": "scifi"}},
+    "size": 0,
+    "aggs": {
+      "avg_rating": {"avg": {"field": "rating"}},
+      "max_year": {"max": {"field": "year"}}
+    }
+  }'
+```
+
+Supported aggregation types: `terms`, `stats`, `min`, `max`, `avg`, `sum`, `value_count`, `histogram`.
+Use `"aggregations"` as an alias for `"aggs"`. Aggregations run on query-filtered hits and merge correctly across shards.
+
 ```bash
 # DSL: range query (inside bool filter)
 curl -X POST 'http://localhost:9200/my-index/_search' \
@@ -311,7 +363,7 @@ Document writes use direct primary-to-replica replication:
 ## Testing
 
 ```bash
-cargo test                                      # All 290 tests
+cargo test                                      # All 305 tests
 cargo test --lib                                # Unit tests (207)
 cargo test --test consensus_integration          # Raft consensus tests (15)
 cargo test --test replication_integration        # Replication tests (11)
@@ -348,7 +400,7 @@ config/            Default configuration
 - [x] Range queries (`gt`, `gte`, `lt`, `lte`)
 - [x] Wildcard and prefix queries
 - [x] Return `_score` in search results
-- [ ] Aggregations (terms, histogram, stats)
+- [x] Aggregations (terms, histogram, stats)
 
 ### Vector Search (k-NN)
 - [x] USearch integration for HNSW-based approximate nearest neighbor search
