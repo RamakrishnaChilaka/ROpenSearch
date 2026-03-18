@@ -110,6 +110,7 @@ mod tests {
                 number_of_shards: 1,
                 number_of_replicas: 0,
                 shard_routing: HashMap::new(),
+                mappings: std::collections::HashMap::new(),
             },
         };
         assert_eq!(format!("{}", cmd), "CreateIndex(test-idx)");
@@ -166,6 +167,7 @@ mod tests {
                 number_of_shards: 3,
                 number_of_replicas: 1,
                 shard_routing,
+                mappings: std::collections::HashMap::new(),
             },
         };
 

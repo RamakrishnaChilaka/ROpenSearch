@@ -101,6 +101,7 @@ fn setup_two_node_cluster_state(
         number_of_shards: 1,
         number_of_replicas: 1,
         shard_routing,
+        mappings: std::collections::HashMap::new(),
     });
     cm.update_state(cs);
 }
@@ -433,6 +434,7 @@ async fn publish_state_updates_cluster_and_closes_deleted_indices() {
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
+            mappings: std::collections::HashMap::new(),
         });
         cm.update_state(initial_state);
     }
