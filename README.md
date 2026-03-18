@@ -373,8 +373,8 @@ Document writes use direct primary-to-replica replication with sequence number t
 ## Testing
 
 ```bash
-cargo test                                      # All 390 tests
-cargo test --lib                                # Unit tests (339)
+cargo test                                      # All 409 tests
+cargo test --lib                                # Unit tests (358)
 cargo test --test consensus_integration          # Raft consensus tests (20)
 cargo test --test replication_integration        # Replication tests (31)
 ```

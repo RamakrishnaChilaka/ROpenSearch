@@ -195,11 +195,32 @@ impl ShardManager {
         let shard_dir = self.data_dir.join(&key.data_dir());
         std::fs::create_dir_all(&shard_dir)?;
 
-        let engine = Arc::new(CompositeEngine::new_with_mappings(
-            &shard_dir,
-            self.refresh_interval,
-            mappings,
-        )?);
+        // Try to open the engine. If it fails with a schema mismatch (stale data
+        // from a previous run whose index was already deleted/re-created), wipe the
+        // orphaned directory and retry with a fresh index.
+        let engine =
+            match CompositeEngine::new_with_mappings(&shard_dir, self.refresh_interval, mappings) {
+                Ok(e) => Arc::new(e),
+                Err(first_err) => {
+                    let err_msg = first_err.to_string();
+                    if err_msg.contains("schema does not match") {
+                        tracing::warn!(
+                            "Schema mismatch for {}/shard_{}, removing stale data and retrying",
+                            index,
+                            shard_id
+                        );
+                        std::fs::remove_dir_all(&shard_dir)?;
+                        std::fs::create_dir_all(&shard_dir)?;
+                        Arc::new(CompositeEngine::new_with_mappings(
+                            &shard_dir,
+                            self.refresh_interval,
+                            mappings,
+                        )?)
+                    } else {
+                        return Err(first_err);
+                    }
+                }
+            };
         CompositeEngine::start_refresh_loop(engine.clone());
 
         // Rebuild vector index from persisted documents (covers crash recovery)

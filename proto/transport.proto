@@ -124,6 +124,7 @@ message ShardSearchResponse {
     bool success = 1;
     repeated SearchHit hits = 2;
     string error = 3;
+    uint64 total_hits = 4;
 }
 
 // ─── Replication ──────────────────────────────────────────────────────────────

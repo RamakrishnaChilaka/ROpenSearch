@@ -2,12 +2,47 @@ use crate::api::AppState;
 use crate::cluster::state::IndexMetadata;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use futures::future::join_all;
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Query parameter for `?refresh=true|false|wait_for`.
+/// Matches the OpenSearch refresh parameter on indexing endpoints.
+#[derive(serde::Deserialize, Default)]
+pub struct RefreshParam {
+    pub refresh: Option<String>,
+}
+
+impl RefreshParam {
+    /// Returns true when the caller explicitly requested an immediate refresh.
+    /// OpenSearch treats `?refresh`, `?refresh=true`, and `?refresh=""` as "refresh now".
+    fn should_refresh(&self) -> bool {
+        match self.as_deref() {
+            Some("true") | Some("") => true,
+            _ => false,
+        }
+    }
+
+    fn as_deref(&self) -> Option<&str> {
+        self.refresh.as_deref()
+    }
+}
+
+/// HEAD /{index} — Check if an index exists.
+pub async fn index_exists(
+    State(state): State<AppState>,
+    Path(index_name): Path<String>,
+) -> StatusCode {
+    let cluster_state = state.cluster_manager.get_state();
+    if cluster_state.indices.contains_key(&index_name) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
 
 /// PUT /{index} — Create an index with shard settings.
 /// Body: `{ "settings": { "number_of_shards": 3, "number_of_replicas": 1 } }`
@@ -184,6 +219,7 @@ pub async fn create_index(
 pub async fn index_document(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
+    Query(refresh_param): Query<RefreshParam>,
     Json(mut payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
@@ -282,7 +318,14 @@ pub async fn index_document(
         .forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &payload)
         .await
     {
-        Ok(res) => (StatusCode::CREATED, Json(res)),
+        Ok(res) => {
+            if refresh_param.should_refresh() {
+                if let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id) {
+                    let _ = engine.refresh();
+                }
+            }
+            (StatusCode::CREATED, Json(res))
+        }
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "forward_exception",
@@ -295,6 +338,7 @@ pub async fn index_document(
 pub async fn index_document_with_id(
     State(state): State<AppState>,
     Path((index_name, doc_id)): Path<(String, String)>,
+    Query(refresh_param): Query<RefreshParam>,
     Json(mut payload): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
@@ -387,7 +431,14 @@ pub async fn index_document_with_id(
         .forward_index_to_shard(&target_node, &index_name, shard_id, &doc_id, &payload)
         .await
     {
-        Ok(res) => (StatusCode::CREATED, Json(res)),
+        Ok(res) => {
+            if refresh_param.should_refresh() {
+                if let Some(engine) = state.shard_manager.get_shard(&index_name, shard_id) {
+                    let _ = engine.refresh();
+                }
+            }
+            (StatusCode::CREATED, Json(res))
+        }
         Err(e) => crate::api::error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "forward_exception",
@@ -396,7 +447,8 @@ pub async fn index_document_with_id(
     }
 }
 
-/// POST /{index}/_refresh — Scatter refresh to all local shard engines for this index.
+/// POST|GET /{index}/_refresh — Scatter refresh to all local shard engines for this index.
+/// If no local shards are open but the index exists in cluster state, opens them first.
 pub async fn refresh_index(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
@@ -409,7 +461,42 @@ pub async fn refresh_index(
         );
     }
 
-    let shards = state.shard_manager.get_index_shards(&index_name);
+    let cluster_state = state.cluster_manager.get_state();
+    let metadata = cluster_state.indices.get(&index_name);
+
+    // If we have no locally-open shards but the index exists in cluster state,
+    // try to open local shards first (handles restart or stale shard state).
+    let mut shards = state.shard_manager.get_index_shards(&index_name);
+    if shards.is_empty() {
+        if let Some(meta) = metadata {
+            for (shard_id, routing) in &meta.shard_routing {
+                if routing.primary == state.local_node_id
+                    || routing.replicas.contains(&state.local_node_id)
+                {
+                    if let Err(e) = state.shard_manager.open_shard_with_mappings(
+                        &index_name,
+                        *shard_id,
+                        &meta.mappings,
+                    ) {
+                        tracing::error!(
+                            "Refresh: failed to open shard {}/{}: {}",
+                            index_name,
+                            shard_id,
+                            e
+                        );
+                    }
+                }
+            }
+            shards = state.shard_manager.get_index_shards(&index_name);
+        } else {
+            return crate::api::error_response(
+                StatusCode::NOT_FOUND,
+                "index_not_found_exception",
+                format!("no such index [{}]", index_name),
+            );
+        }
+    }
+
     let mut successful = 0;
     let mut failed = 0;
 
@@ -466,10 +553,237 @@ pub async fn flush_index(
     )
 }
 
+/// Parsed bulk document with optional index from action metadata.
+struct BulkDoc {
+    doc_id: String,
+    index: Option<String>,
+    payload: Value,
+}
+
+/// Parse NDJSON bulk body into a list of documents.
+/// Supports standard OpenSearch format:
+///   {"index": {"_index": "idx", "_id": "1"}}
+///   {"field": "value"}
+/// Also supports legacy FerrisSearch format where _id is in the doc itself.
+fn parse_bulk_ndjson(text: &str) -> Vec<BulkDoc> {
+    let mut docs = Vec::new();
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    while let Some(action_line) = lines.next() {
+        if let Some(doc_line) = lines.next() {
+            if let Ok(mut doc) = serde_json::from_str::<Value>(doc_line) {
+                // Parse action metadata
+                let action_meta =
+                    serde_json::from_str::<Value>(action_line)
+                        .ok()
+                        .and_then(|action| {
+                            action
+                                .as_object()
+                                .and_then(|obj| obj.values().next().cloned())
+                        });
+
+                let action_id = action_meta
+                    .as_ref()
+                    .and_then(|m| m.get("_id").and_then(|v| v.as_str().map(String::from)));
+
+                let action_index = action_meta
+                    .as_ref()
+                    .and_then(|m| m.get("_index").and_then(|v| v.as_str().map(String::from)));
+
+                let doc_id = if let Some(id) = action_id {
+                    id
+                } else if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
+                    id.to_string()
+                } else if let Some(id) = doc.get("_doc_id").and_then(|v| v.as_str()) {
+                    id.to_string()
+                } else {
+                    uuid::Uuid::new_v4().to_string()
+                };
+                // Strip id metadata from stored payload
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.remove("_id");
+                    obj.remove("_doc_id");
+                }
+                // If doc has _source wrapper, unwrap it
+                let payload = if let Some(source) = doc.get("_source").cloned() {
+                    source
+                } else {
+                    doc
+                };
+                docs.push(BulkDoc {
+                    doc_id,
+                    index: action_index,
+                    payload,
+                });
+            }
+        }
+    }
+    docs
+}
+
+/// POST /_bulk — Global bulk endpoint (index name comes from action metadata).
+pub async fn bulk_index_global(
+    State(state): State<AppState>,
+    Query(refresh_param): Query<RefreshParam>,
+    body: axum::body::Bytes,
+) -> (StatusCode, Json<Value>) {
+    let text = match std::str::from_utf8(&body) {
+        Ok(t) => t,
+        Err(_) => {
+            return crate::api::error_response(
+                StatusCode::BAD_REQUEST,
+                "parse_exception",
+                "Invalid UTF-8 body",
+            );
+        }
+    };
+
+    let docs = parse_bulk_ndjson(text);
+
+    if docs.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "took": 0, "errors": false, "items": [] })),
+        );
+    }
+
+    // Group by index, then dispatch to per-index bulk logic
+    let mut by_index: HashMap<String, Vec<(String, Value)>> = HashMap::new();
+    for doc in &docs {
+        if let Some(ref idx) = doc.index {
+            by_index
+                .entry(idx.clone())
+                .or_default()
+                .push((doc.doc_id.clone(), doc.payload.clone()));
+        }
+    }
+
+    // For now, forward each index batch via the same shard-routing logic
+    let cluster_state = state.cluster_manager.get_state();
+    let mut all_items: Vec<Value> = Vec::new();
+    let mut has_errors = false;
+
+    for (index_name, batch) in &by_index {
+        let metadata = if let Some(m) = cluster_state.indices.get(index_name) {
+            m.clone()
+        } else {
+            // Auto-create index
+            let mut shard_routing = HashMap::new();
+            shard_routing.insert(
+                0u32,
+                crate::cluster::state::ShardRoutingEntry {
+                    primary: state.local_node_id.clone(),
+                    replicas: vec![],
+                    unassigned_replicas: 0,
+                },
+            );
+            let m = IndexMetadata {
+                name: index_name.clone(),
+                number_of_shards: 1,
+                number_of_replicas: 0,
+                shard_routing,
+                mappings: HashMap::new(),
+            };
+            if let Some(ref raft) = state.raft {
+                let cmd = crate::consensus::types::ClusterCommand::CreateIndex {
+                    metadata: m.clone(),
+                };
+                if let Err(e) = raft.client_write(cmd).await {
+                    has_errors = true;
+                    for (id, _) in batch {
+                        all_items.push(serde_json::json!({
+                            "index": {
+                                "_index": index_name,
+                                "_id": id,
+                                "status": 500,
+                                "error": { "type": "raft_write_exception", "reason": format!("{}", e) }
+                            }
+                        }));
+                    }
+                    continue;
+                }
+            } else {
+                let mut new_state = cluster_state.clone();
+                new_state.add_index(m.clone());
+                state.cluster_manager.update_state(new_state.clone());
+                state.transport_client.publish_state(&new_state).await;
+            }
+            let _ = state.shard_manager.open_shard(index_name, 0);
+            m
+        };
+
+        // Route docs to shards
+        let mut shard_batches: HashMap<(String, u32), Vec<(String, Value)>> = HashMap::new();
+        for (doc_id, payload) in batch {
+            let shard_id =
+                crate::engine::routing::calculate_shard(doc_id, metadata.number_of_shards);
+            if let Some(node_id) = metadata.primary_node(shard_id) {
+                shard_batches
+                    .entry((node_id.clone(), shard_id))
+                    .or_default()
+                    .push((doc_id.clone(), payload.clone()));
+            }
+        }
+
+        let mut futures = Vec::new();
+        for ((node_id, shard_id), shard_batch) in shard_batches {
+            if let Some(node_info) = cluster_state.nodes.get(&node_id) {
+                let client = state.transport_client.clone();
+                let node_info = node_info.clone();
+                let idx = index_name.clone();
+                futures.push(tokio::spawn(async move {
+                    client
+                        .forward_bulk_to_shard(&node_info, &idx, shard_id, &shard_batch)
+                        .await
+                }));
+            }
+        }
+
+        let results = join_all(futures).await;
+        let successful = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
+        if successful < results.len() {
+            has_errors = true;
+        }
+
+        for (id, _) in batch {
+            all_items.push(serde_json::json!({
+                "index": {
+                    "_index": index_name,
+                    "_id": id,
+                    "_version": 1,
+                    "result": "created",
+                    "status": 201,
+                    "_shards": { "total": 1, "successful": 1, "failed": 0 },
+                    "_seq_no": 0,
+                    "_primary_term": 1
+                }
+            }));
+        }
+    }
+
+    // ?refresh=true: commit + reload all affected shards so docs are immediately searchable
+    if refresh_param.should_refresh() {
+        for index_name in by_index.keys() {
+            for (_, engine) in state.shard_manager.get_index_shards(index_name) {
+                let _ = engine.refresh();
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "took": 0,
+            "errors": has_errors,
+            "items": all_items
+        })),
+    )
+}
+
 /// POST /{index}/_bulk — Parse NDJSON, route each doc to the correct shard node.
 pub async fn bulk_index(
     State(state): State<AppState>,
     Path(index_name): Path<String>,
+    Query(refresh_param): Query<RefreshParam>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<Value>) {
     if let Err(msg) = crate::common::validate_index_name(&index_name) {
@@ -491,25 +805,11 @@ pub async fn bulk_index(
         }
     };
 
-    // Parse NDJSON: alternating action/doc lines
-    let mut docs: Vec<(String, Value)> = Vec::new(); // (doc_id, payload)
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    while let Some(_action_line) = lines.next() {
-        if let Some(doc_line) = lines.next() {
-            if let Ok(mut doc) = serde_json::from_str::<Value>(doc_line) {
-                let doc_id = if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
-                    id.to_string()
-                } else {
-                    uuid::Uuid::new_v4().to_string()
-                };
-                // Strip _id from stored payload — it's metadata, not document source
-                if let Some(obj) = doc.as_object_mut() {
-                    obj.remove("_id");
-                }
-                docs.push((doc_id, doc));
-            }
-        }
-    }
+    // Parse NDJSON body
+    let docs: Vec<(String, Value)> = parse_bulk_ndjson(text)
+        .into_iter()
+        .map(|d| (d.doc_id, d.payload))
+        .collect();
 
     if docs.is_empty() {
         return (
@@ -594,12 +894,30 @@ pub async fn bulk_index(
     let successful = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
     let has_errors = successful < results.len();
 
+    // ?refresh=true: commit + reload all affected shards so docs are immediately searchable
+    if refresh_param.should_refresh() {
+        for (_, engine) in state.shard_manager.get_index_shards(&index_name) {
+            let _ = engine.refresh();
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "took": 0,
             "errors": has_errors,
-            "items": docs.iter().map(|(id, _)| serde_json::json!({ "index": { "_id": id, "result": "created" } })).collect::<Vec<_>>()
+            "items": docs.iter().map(|(id, _)| serde_json::json!({
+                "index": {
+                    "_index": index_name,
+                    "_id": id,
+                    "_version": 1,
+                    "result": "created",
+                    "status": 201,
+                    "_shards": { "total": 1, "successful": 1, "failed": 0 },
+                    "_seq_no": 0,
+                    "_primary_term": 1
+                }
+            })).collect::<Vec<_>>()
         })),
     )
 }
@@ -645,13 +963,15 @@ pub async fn search_documents_dsl(
     let mut knn_hits = Vec::new();
     let mut successful = 0u32;
     let mut failed = 0u32;
+    let mut total_hits: usize = 0;
     let is_hybrid = search_req.knn.is_some();
 
     // Query local shards directly (text search)
     for (shard_id, engine) in state.shard_manager.get_index_shards(&index_name) {
         match engine.search_query(&search_req) {
-            Ok(hits) => {
+            Ok((hits, shard_total)) => {
                 successful += 1;
+                total_hits += shard_total;
                 for hit in hits {
                     text_hits.push(serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
@@ -738,8 +1058,9 @@ pub async fn search_documents_dsl(
     let remote_results = join_all(remote_futures).await;
     for result in remote_results {
         match result {
-            Ok((shard_id, Ok(hits))) => {
+            Ok((shard_id, Ok((hits, shard_total)))) => {
                 successful += 1;
+                total_hits += shard_total;
                 for hit in hits {
                     let enriched = serde_json::json!({
                         "_index": index_name, "_shard": shard_id,
@@ -796,7 +1117,7 @@ pub async fn search_documents_dsl(
         std::collections::HashMap::new()
     };
 
-    let total = all_hits.len();
+    let total = total_hits;
     let paginated: Vec<_> = all_hits
         .into_iter()
         .skip(search_req.from)
@@ -1127,4 +1448,143 @@ pub async fn delete_index(
         StatusCode::OK,
         Json(serde_json::json!({ "acknowledged": true })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_opensearch_ndjson_format() {
+        let input = r#"{"index":{"_index":"my-index","_id":"1"}}
+{"title":"Hello","year":2024}
+{"index":{"_index":"my-index","_id":"2"}}
+{"title":"World","year":2025}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].doc_id, "1");
+        assert_eq!(docs[0].index.as_deref(), Some("my-index"));
+        assert_eq!(docs[0].payload["title"], "Hello");
+        assert_eq!(docs[1].doc_id, "2");
+        assert_eq!(docs[1].payload["year"], 2025);
+    }
+
+    #[test]
+    fn parse_opensearch_create_action() {
+        let input = r#"{"create":{"_index":"logs","_id":"abc"}}
+{"msg":"test log"}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_id, "abc");
+        assert_eq!(docs[0].index.as_deref(), Some("logs"));
+        assert_eq!(docs[0].payload["msg"], "test log");
+    }
+
+    #[test]
+    fn parse_legacy_ferrissearch_format() {
+        let input = r#"{}
+{"_doc_id":"d1","_source":{"name":"Alice"}}
+{}
+{"_doc_id":"d2","_source":{"name":"Bob"}}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].doc_id, "d1");
+        assert_eq!(docs[0].payload["name"], "Alice");
+        assert_eq!(docs[1].doc_id, "d2");
+        assert_eq!(docs[1].payload["name"], "Bob");
+    }
+
+    #[test]
+    fn parse_id_in_doc_body_fallback() {
+        let input = r#"{"index":{}}
+{"_id":"from-body","title":"test"}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_id, "from-body");
+        assert!(docs[0].payload.get("_id").is_none());
+        assert_eq!(docs[0].payload["title"], "test");
+    }
+
+    #[test]
+    fn parse_action_id_takes_precedence_over_body_id() {
+        let input = r#"{"index":{"_id":"action-id"}}
+{"_id":"body-id","title":"test"}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_id, "action-id");
+    }
+
+    #[test]
+    fn parse_auto_generates_id_when_missing() {
+        let input = r#"{"index":{}}
+{"title":"no id"}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 1);
+        assert!(!docs[0].doc_id.is_empty());
+        assert_eq!(docs[0].payload["title"], "no id");
+    }
+
+    #[test]
+    fn parse_empty_body() {
+        let docs = parse_bulk_ndjson("");
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn parse_blank_lines_are_skipped() {
+        let input = r#"{"index":{"_id":"1"}}
+
+{"title":"Hello"}
+
+{"index":{"_id":"2"}}
+
+{"title":"World"}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[test]
+    fn parse_source_wrapper_unwrapped() {
+        let input = r#"{"index":{"_id":"1"}}
+{"_source":{"name":"Alice"},"_doc_id":"ignored"}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_id, "1");
+        assert_eq!(docs[0].payload["name"], "Alice");
+    }
+
+    #[test]
+    fn parse_index_extracted_from_action() {
+        let input = r#"{"index":{"_index":"idx-a","_id":"1"}}
+{"f":"v1"}
+{"index":{"_index":"idx-b","_id":"2"}}
+{"f":"v2"}
+{"index":{"_id":"3"}}
+{"f":"v3"}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].index.as_deref(), Some("idx-a"));
+        assert_eq!(docs[1].index.as_deref(), Some("idx-b"));
+        assert!(docs[2].index.is_none());
+    }
+
+    #[test]
+    fn parse_odd_number_of_lines_ignores_trailing() {
+        let input = r#"{"index":{"_id":"1"}}
+{"title":"complete"}
+{"index":{"_id":"2"}}
+"#;
+        let docs = parse_bulk_ndjson(input);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].doc_id, "1");
+    }
 }

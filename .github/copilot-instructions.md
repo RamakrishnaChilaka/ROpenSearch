@@ -42,7 +42,7 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `ClusterCommand::SetMaster { node_id }`
 
 ## Test Suite
-- 339 unit tests + 20 consensus integration + 31 replication integration = 390 total
+- 358 unit tests + 20 consensus integration + 31 replication integration = 409 total
 - Run with: `cargo test`
 - Dev cluster: `./dev_cluster.sh 1`, `./dev_cluster.sh 2`, `./dev_cluster.sh 3` (sets unique RAFT_NODE_ID per node)
 

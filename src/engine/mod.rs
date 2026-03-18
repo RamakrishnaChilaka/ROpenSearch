@@ -50,7 +50,11 @@ pub trait SearchEngine: Send + Sync {
     fn search(&self, query_str: &str) -> Result<Vec<serde_json::Value>>;
 
     /// Search using the OpenSearch Query DSL body.
-    fn search_query(&self, req: &crate::search::SearchRequest) -> Result<Vec<serde_json::Value>>;
+    /// Returns (hits, total_matching_docs).
+    fn search_query(
+        &self,
+        req: &crate::search::SearchRequest,
+    ) -> Result<(Vec<serde_json::Value>, usize)>;
 
     /// k-NN vector search. Returns hits with _id, _score, _source, _knn_distance.
     /// Default implementation returns empty (no vector support).
