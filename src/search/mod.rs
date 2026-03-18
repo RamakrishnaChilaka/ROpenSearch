@@ -17,9 +17,11 @@ pub struct SearchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knn: Option<KnnQuery>,
     /// Optional sort clauses. Default: sort by `_score` descending.
-    /// Example: `[{"year": "desc"}, "_score"]`
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sort: Vec<SortClause>,
+    /// Optional aggregations. Maps agg name → agg definition.
+    #[serde(default, alias = "aggregations", skip_serializing_if = "HashMap::is_empty")]
+    pub aggs: HashMap<String, AggregationRequest>,
 }
 
 /// A single sort clause. Supports field sort and `_score` sort.
@@ -143,6 +145,358 @@ pub struct BoolQuery {
     pub must_not: Vec<QueryClause>,
     #[serde(default)]
     pub filter: Vec<QueryClause>,
+}
+
+// ── Aggregation types ───────────────────────────────────────────────────────
+
+/// An aggregation request. Each variant maps to an OpenSearch aggregation type.
+/// Designed so that each engine (shard, split, or segment) computes a partial
+/// result, which is then merged at the coordinator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregationRequest {
+    /// Terms aggregation: top-N buckets by keyword value.
+    /// `{ "terms": { "field": "genre", "size": 10 } }`
+    Terms(TermsAggParams),
+    /// Stats aggregation: min, max, sum, count, avg.
+    /// `{ "stats": { "field": "rating" } }`
+    Stats(MetricAggParams),
+    /// Min aggregation.
+    Min(MetricAggParams),
+    /// Max aggregation.
+    Max(MetricAggParams),
+    /// Avg aggregation.
+    Avg(MetricAggParams),
+    /// Sum aggregation.
+    Sum(MetricAggParams),
+    /// Value count: count of non-null values.
+    ValueCount(MetricAggParams),
+    /// Histogram: fixed-interval numeric buckets.
+    /// `{ "histogram": { "field": "year", "interval": 10 } }`
+    Histogram(HistogramAggParams),
+}
+
+/// Parameters for a terms aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TermsAggParams {
+    pub field: String,
+    #[serde(default = "default_terms_size")]
+    pub size: usize,
+}
+
+fn default_terms_size() -> usize {
+    10
+}
+
+/// Parameters for a metric aggregation (stats, min, max, avg, sum, value_count).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricAggParams {
+    pub field: String,
+}
+
+/// Parameters for a histogram aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistogramAggParams {
+    pub field: String,
+    pub interval: f64,
+}
+
+/// A partial aggregation result from a single shard/split.
+/// Designed to be mergeable: the coordinator combines partials from all shards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PartialAggResult {
+    /// Terms: map of value → doc_count (partial counts per shard)
+    Terms { buckets: Vec<TermsBucket> },
+    /// Stats: partial stats that can be combined (sum, count, min, max)
+    Stats { count: u64, sum: f64, min: f64, max: f64 },
+    /// Single metric value
+    Metric { value: Option<f64> },
+    /// Histogram buckets: key → doc_count
+    Histogram { buckets: Vec<HistogramBucket> },
+}
+
+/// A single bucket in a terms aggregation result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TermsBucket {
+    pub key: String,
+    pub doc_count: u64,
+}
+
+/// A single bucket in a histogram aggregation result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistogramBucket {
+    pub key: f64,
+    pub doc_count: u64,
+}
+
+/// Compute aggregations from a list of search hits (JSON objects with `_source`).
+/// This runs per-shard/per-split and produces partial results for coordinator merge.
+pub fn compute_aggregations(
+    hits: &[serde_json::Value],
+    aggs: &HashMap<String, AggregationRequest>,
+) -> HashMap<String, PartialAggResult> {
+    let mut results = HashMap::new();
+
+    for (name, agg_req) in aggs {
+        let result = match agg_req {
+            AggregationRequest::Terms(params) => compute_terms(hits, &params.field, params.size),
+            AggregationRequest::Stats(params) => compute_stats(hits, &params.field),
+            AggregationRequest::Min(params) => {
+                let stats = compute_stats_raw(hits, &params.field);
+                PartialAggResult::Metric { value: if stats.count > 0 { Some(stats.min) } else { None } }
+            }
+            AggregationRequest::Max(params) => {
+                let stats = compute_stats_raw(hits, &params.field);
+                PartialAggResult::Metric { value: if stats.count > 0 { Some(stats.max) } else { None } }
+            }
+            AggregationRequest::Avg(params) => {
+                let stats = compute_stats_raw(hits, &params.field);
+                PartialAggResult::Stats { count: stats.count, sum: stats.sum, min: stats.min, max: stats.max }
+            }
+            AggregationRequest::Sum(params) => {
+                let stats = compute_stats_raw(hits, &params.field);
+                PartialAggResult::Metric { value: Some(stats.sum) }
+            }
+            AggregationRequest::ValueCount(params) => {
+                let count = hits.iter()
+                    .filter(|h| h.get("_source").and_then(|s| s.get(&params.field)).is_some())
+                    .count();
+                PartialAggResult::Metric { value: Some(count as f64) }
+            }
+            AggregationRequest::Histogram(params) => compute_histogram(hits, &params.field, params.interval),
+        };
+        results.insert(name.clone(), result);
+    }
+
+    results
+}
+
+struct RawStats {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+fn compute_stats_raw(hits: &[serde_json::Value], field: &str) -> RawStats {
+    let mut count = 0u64;
+    let mut sum = 0.0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+
+    for hit in hits {
+        if let Some(val) = hit.get("_source").and_then(|s| s.get(field)).and_then(|v| v.as_f64()) {
+            count += 1;
+            sum += val;
+            if val < min { min = val; }
+            if val > max { max = val; }
+        }
+    }
+
+    RawStats { count, sum, min, max }
+}
+
+fn compute_stats(hits: &[serde_json::Value], field: &str) -> PartialAggResult {
+    let s = compute_stats_raw(hits, field);
+    PartialAggResult::Stats { count: s.count, sum: s.sum, min: s.min, max: s.max }
+}
+
+fn compute_terms(hits: &[serde_json::Value], field: &str, size: usize) -> PartialAggResult {
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for hit in hits {
+        if let Some(val) = hit.get("_source").and_then(|s| s.get(field)) {
+            let key = match val {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => continue,
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut buckets: Vec<TermsBucket> = counts.into_iter()
+        .map(|(key, doc_count)| TermsBucket { key, doc_count })
+        .collect();
+    buckets.sort_by(|a, b| b.doc_count.cmp(&a.doc_count));
+    buckets.truncate(size);
+
+    PartialAggResult::Terms { buckets }
+}
+
+fn compute_histogram(hits: &[serde_json::Value], field: &str, interval: f64) -> PartialAggResult {
+    let mut bucket_counts: HashMap<i64, u64> = HashMap::new();
+    for hit in hits {
+        if let Some(val) = hit.get("_source").and_then(|s| s.get(field)).and_then(|v| v.as_f64()) {
+            let bucket_key = (val / interval).floor() as i64;
+            *bucket_counts.entry(bucket_key).or_insert(0) += 1;
+        }
+    }
+
+    let mut buckets: Vec<HistogramBucket> = bucket_counts.into_iter()
+        .map(|(k, doc_count)| HistogramBucket { key: k as f64 * interval, doc_count })
+        .collect();
+    buckets.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(std::cmp::Ordering::Equal));
+
+    PartialAggResult::Histogram { buckets }
+}
+
+/// Merge partial aggregation results from multiple shards/splits.
+/// This is the coordinator-level merge that combines partial agg results.
+pub fn merge_aggregations(
+    partials: Vec<HashMap<String, PartialAggResult>>,
+    aggs: &HashMap<String, AggregationRequest>,
+) -> HashMap<String, serde_json::Value> {
+    let mut merged = HashMap::new();
+
+    for (name, agg_req) in aggs {
+        let parts: Vec<&PartialAggResult> = partials.iter()
+            .filter_map(|p| p.get(name))
+            .collect();
+
+        let result = match agg_req {
+            AggregationRequest::Terms(params) => merge_terms(&parts, params.size),
+            AggregationRequest::Stats(_) => merge_stats(&parts),
+            AggregationRequest::Min(_) => merge_min(&parts),
+            AggregationRequest::Max(_) => merge_max(&parts),
+            AggregationRequest::Avg(_) => merge_avg(&parts),
+            AggregationRequest::Sum(_) => merge_sum(&parts),
+            AggregationRequest::ValueCount(_) => merge_value_count(&parts),
+            AggregationRequest::Histogram(_) => merge_histogram(&parts),
+        };
+
+        merged.insert(name.clone(), result);
+    }
+
+    merged
+}
+
+fn merge_terms(parts: &[&PartialAggResult], size: usize) -> serde_json::Value {
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for part in parts {
+        if let PartialAggResult::Terms { buckets } = part {
+            for b in buckets {
+                *counts.entry(b.key.clone()).or_insert(0) += b.doc_count;
+            }
+        }
+    }
+    let mut buckets: Vec<serde_json::Value> = counts.into_iter()
+        .map(|(key, doc_count)| serde_json::json!({"key": key, "doc_count": doc_count}))
+        .collect();
+    buckets.sort_by(|a, b| {
+        let ca = a["doc_count"].as_u64().unwrap_or(0);
+        let cb = b["doc_count"].as_u64().unwrap_or(0);
+        cb.cmp(&ca)
+    });
+    buckets.truncate(size);
+    serde_json::json!({"buckets": buckets})
+}
+
+fn merge_stats(parts: &[&PartialAggResult]) -> serde_json::Value {
+    let mut count = 0u64;
+    let mut sum = 0.0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+
+    for part in parts {
+        if let PartialAggResult::Stats { count: c, sum: s, min: mn, max: mx } = part {
+            count += c;
+            sum += s;
+            if *mn < min { min = *mn; }
+            if *mx > max { max = *mx; }
+        }
+    }
+
+    let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+    serde_json::json!({
+        "count": count,
+        "min": if count > 0 { serde_json::json!(min) } else { serde_json::Value::Null },
+        "max": if count > 0 { serde_json::json!(max) } else { serde_json::Value::Null },
+        "avg": if count > 0 { serde_json::json!(avg) } else { serde_json::Value::Null },
+        "sum": sum
+    })
+}
+
+fn merge_min(parts: &[&PartialAggResult]) -> serde_json::Value {
+    let mut min = f64::INFINITY;
+    let mut found = false;
+    for part in parts {
+        match part {
+            PartialAggResult::Metric { value: Some(v) } => { if *v < min { min = *v; } found = true; }
+            PartialAggResult::Stats { min: v, count, .. } if *count > 0 => { if *v < min { min = *v; } found = true; }
+            _ => {}
+        }
+    }
+    serde_json::json!({"value": if found { serde_json::json!(min) } else { serde_json::Value::Null }})
+}
+
+fn merge_max(parts: &[&PartialAggResult]) -> serde_json::Value {
+    let mut max = f64::NEG_INFINITY;
+    let mut found = false;
+    for part in parts {
+        match part {
+            PartialAggResult::Metric { value: Some(v) } => { if *v > max { max = *v; } found = true; }
+            PartialAggResult::Stats { max: v, count, .. } if *count > 0 => { if *v > max { max = *v; } found = true; }
+            _ => {}
+        }
+    }
+    serde_json::json!({"value": if found { serde_json::json!(max) } else { serde_json::Value::Null }})
+}
+
+fn merge_avg(parts: &[&PartialAggResult]) -> serde_json::Value {
+    let mut count = 0u64;
+    let mut sum = 0.0f64;
+    for part in parts {
+        if let PartialAggResult::Stats { count: c, sum: s, .. } = part {
+            count += c;
+            sum += s;
+        }
+    }
+    let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+    serde_json::json!({"value": if count > 0 { serde_json::json!(avg) } else { serde_json::Value::Null }})
+}
+
+fn merge_sum(parts: &[&PartialAggResult]) -> serde_json::Value {
+    let mut sum = 0.0f64;
+    for part in parts {
+        if let PartialAggResult::Metric { value: Some(v) } = part {
+            sum += v;
+        }
+    }
+    serde_json::json!({"value": sum})
+}
+
+fn merge_value_count(parts: &[&PartialAggResult]) -> serde_json::Value {
+    let mut count = 0.0f64;
+    for part in parts {
+        if let PartialAggResult::Metric { value: Some(v) } = part {
+            count += v;
+        }
+    }
+    serde_json::json!({"value": count as u64})
+}
+
+fn merge_histogram(parts: &[&PartialAggResult]) -> serde_json::Value {
+    let mut bucket_counts: HashMap<i64, u64> = HashMap::new();
+    for part in parts {
+        if let PartialAggResult::Histogram { buckets } = part {
+            for b in buckets {
+                // Use integer key for exact bucketing
+                let k = (b.key * 1000.0).round() as i64;
+                *bucket_counts.entry(k).or_insert(0) += b.doc_count;
+            }
+        }
+    }
+    let mut buckets: Vec<serde_json::Value> = bucket_counts.into_iter()
+        .map(|(k, doc_count)| serde_json::json!({"key": k as f64 / 1000.0, "doc_count": doc_count}))
+        .collect();
+    buckets.sort_by(|a, b| {
+        let ka = a["key"].as_f64().unwrap_or(0.0);
+        let kb = b["key"].as_f64().unwrap_or(0.0);
+        ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    serde_json::json!({"buckets": buckets})
 }
 
 /// Sort a list of search hits according to the given sort clauses.
@@ -438,6 +792,7 @@ mod tests {
             from: 5,
             knn: None,
             sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let json_str = serde_json::to_string(&req).unwrap();
         let req2: SearchRequest = serde_json::from_str(&json_str).unwrap();
@@ -562,6 +917,7 @@ mod tests {
             from: 10,
             knn: None,
             sort: vec![],
+            aggs: std::collections::HashMap::new(),
         };
         let json_str = serde_json::to_string(&req).unwrap();
         let req2: SearchRequest = serde_json::from_str(&json_str).unwrap();
@@ -1159,5 +1515,246 @@ mod tests {
         let body = json!({"query": {"match_all": {}}});
         let req: SearchRequest = serde_json::from_value(body).unwrap();
         assert!(req.sort.is_empty());
+    }
+
+    // ── Aggregation tests ───────────────────────────────────────────────
+
+    fn make_hits(sources: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        sources.into_iter().enumerate()
+            .map(|(i, src)| json!({"_id": format!("d{}", i), "_score": 1.0, "_source": src}))
+            .collect()
+    }
+
+    #[test]
+    fn terms_aggregation_counts_correctly() {
+        let hits = make_hits(vec![
+            json!({"genre": "scifi"}),
+            json!({"genre": "action"}),
+            json!({"genre": "scifi"}),
+            json!({"genre": "scifi"}),
+            json!({"genre": "action"}),
+        ]);
+        let mut aggs = HashMap::new();
+        aggs.insert("genres".into(), AggregationRequest::Terms(TermsAggParams { field: "genre".into(), size: 10 }));
+
+        let result = compute_aggregations(&hits, &aggs);
+        let merged = merge_aggregations(vec![result], &aggs);
+        let buckets = merged["genres"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0]["key"], "scifi");
+        assert_eq!(buckets[0]["doc_count"], 3);
+        assert_eq!(buckets[1]["key"], "action");
+        assert_eq!(buckets[1]["doc_count"], 2);
+    }
+
+    #[test]
+    fn terms_aggregation_respects_size() {
+        let hits = make_hits(vec![
+            json!({"color": "red"}), json!({"color": "blue"}), json!({"color": "green"}),
+        ]);
+        let mut aggs = HashMap::new();
+        aggs.insert("colors".into(), AggregationRequest::Terms(TermsAggParams { field: "color".into(), size: 2 }));
+
+        let result = compute_aggregations(&hits, &aggs);
+        let merged = merge_aggregations(vec![result], &aggs);
+        let buckets = merged["colors"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 2, "should be limited to size=2");
+    }
+
+    #[test]
+    fn stats_aggregation() {
+        let hits = make_hits(vec![
+            json!({"rating": 8.0}), json!({"rating": 9.0}), json!({"rating": 7.0}),
+        ]);
+        let mut aggs = HashMap::new();
+        aggs.insert("rating_stats".into(), AggregationRequest::Stats(MetricAggParams { field: "rating".into() }));
+
+        let result = compute_aggregations(&hits, &aggs);
+        let merged = merge_aggregations(vec![result], &aggs);
+        let stats = &merged["rating_stats"];
+        assert_eq!(stats["count"], 3);
+        assert_eq!(stats["min"], 7.0);
+        assert_eq!(stats["max"], 9.0);
+        assert_eq!(stats["sum"], 24.0);
+        assert_eq!(stats["avg"], 8.0);
+    }
+
+    #[test]
+    fn min_max_avg_sum_aggregations() {
+        let hits = make_hits(vec![
+            json!({"price": 10.0}), json!({"price": 30.0}), json!({"price": 20.0}),
+        ]);
+        for (name, agg) in [
+            ("min_price", AggregationRequest::Min(MetricAggParams { field: "price".into() })),
+            ("max_price", AggregationRequest::Max(MetricAggParams { field: "price".into() })),
+            ("avg_price", AggregationRequest::Avg(MetricAggParams { field: "price".into() })),
+            ("sum_price", AggregationRequest::Sum(MetricAggParams { field: "price".into() })),
+        ] {
+            let mut aggs = HashMap::new();
+            aggs.insert(name.into(), agg);
+            let result = compute_aggregations(&hits, &aggs);
+            let merged = merge_aggregations(vec![result], &aggs);
+            match name {
+                "min_price" => assert_eq!(merged[name]["value"], 10.0),
+                "max_price" => assert_eq!(merged[name]["value"], 30.0),
+                "avg_price" => assert_eq!(merged[name]["value"], 20.0),
+                "sum_price" => assert_eq!(merged[name]["value"], 60.0),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn value_count_aggregation() {
+        let hits = make_hits(vec![
+            json!({"title": "a"}), json!({"title": "b"}), json!({}), // 3rd has no title
+        ]);
+        let mut aggs = HashMap::new();
+        aggs.insert("title_count".into(), AggregationRequest::ValueCount(MetricAggParams { field: "title".into() }));
+
+        let result = compute_aggregations(&hits, &aggs);
+        let merged = merge_aggregations(vec![result], &aggs);
+        assert_eq!(merged["title_count"]["value"], 2);
+    }
+
+    #[test]
+    fn histogram_aggregation() {
+        let hits = make_hits(vec![
+            json!({"year": 1999}), json!({"year": 2003}), json!({"year": 2010}),
+            json!({"year": 2014}), json!({"year": 2008}),
+        ]);
+        let mut aggs = HashMap::new();
+        aggs.insert("decade".into(), AggregationRequest::Histogram(HistogramAggParams { field: "year".into(), interval: 10.0 }));
+
+        let result = compute_aggregations(&hits, &aggs);
+        let merged = merge_aggregations(vec![result], &aggs);
+        let buckets = merged["decade"]["buckets"].as_array().unwrap();
+        // 1990s: 1 (1999), 2000s: 2 (2003, 2008), 2010s: 2 (2010, 2014)
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0]["key"], 1990.0);
+        assert_eq!(buckets[0]["doc_count"], 1);
+        assert_eq!(buckets[1]["key"], 2000.0);
+        assert_eq!(buckets[1]["doc_count"], 2);
+        assert_eq!(buckets[2]["key"], 2010.0);
+        assert_eq!(buckets[2]["doc_count"], 2);
+    }
+
+    #[test]
+    fn merge_terms_across_shards() {
+        let hits1 = make_hits(vec![json!({"genre": "scifi"}), json!({"genre": "scifi"})]);
+        let hits2 = make_hits(vec![json!({"genre": "action"}), json!({"genre": "scifi"})]);
+
+        let mut aggs = HashMap::new();
+        aggs.insert("genres".into(), AggregationRequest::Terms(TermsAggParams { field: "genre".into(), size: 10 }));
+
+        let r1 = compute_aggregations(&hits1, &aggs);
+        let r2 = compute_aggregations(&hits2, &aggs);
+        let merged = merge_aggregations(vec![r1, r2], &aggs);
+        let buckets = merged["genres"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets[0]["key"], "scifi");
+        assert_eq!(buckets[0]["doc_count"], 3); // 2 + 1
+        assert_eq!(buckets[1]["key"], "action");
+        assert_eq!(buckets[1]["doc_count"], 1);
+    }
+
+    #[test]
+    fn merge_stats_across_shards() {
+        let hits1 = make_hits(vec![json!({"v": 1.0}), json!({"v": 5.0})]);
+        let hits2 = make_hits(vec![json!({"v": 3.0}), json!({"v": 10.0})]);
+
+        let mut aggs = HashMap::new();
+        aggs.insert("s".into(), AggregationRequest::Stats(MetricAggParams { field: "v".into() }));
+
+        let r1 = compute_aggregations(&hits1, &aggs);
+        let r2 = compute_aggregations(&hits2, &aggs);
+        let merged = merge_aggregations(vec![r1, r2], &aggs);
+        assert_eq!(merged["s"]["count"], 4);
+        assert_eq!(merged["s"]["min"], 1.0);
+        assert_eq!(merged["s"]["max"], 10.0);
+        assert_eq!(merged["s"]["sum"], 19.0);
+        assert_eq!(merged["s"]["avg"], 4.75);
+    }
+
+    #[test]
+    fn empty_hits_produce_null_stats() {
+        let hits: Vec<serde_json::Value> = vec![];
+        let mut aggs = HashMap::new();
+        aggs.insert("s".into(), AggregationRequest::Stats(MetricAggParams { field: "v".into() }));
+
+        let result = compute_aggregations(&hits, &aggs);
+        let merged = merge_aggregations(vec![result], &aggs);
+        assert_eq!(merged["s"]["count"], 0);
+        assert!(merged["s"]["min"].is_null());
+        assert!(merged["s"]["max"].is_null());
+    }
+
+    #[test]
+    fn deserialize_aggs_terms() {
+        let body = json!({
+            "query": {"match_all": {}},
+            "aggs": {
+                "genres": {"terms": {"field": "genre", "size": 5}}
+            }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.aggs.len(), 1);
+        assert!(matches!(req.aggs.get("genres"), Some(AggregationRequest::Terms(_))));
+    }
+
+    #[test]
+    fn deserialize_aggs_stats() {
+        let body = json!({
+            "query": {"match_all": {}},
+            "aggs": {
+                "rating_stats": {"stats": {"field": "rating"}}
+            }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert!(matches!(req.aggs.get("rating_stats"), Some(AggregationRequest::Stats(_))));
+    }
+
+    #[test]
+    fn deserialize_aggs_histogram() {
+        let body = json!({
+            "query": {"match_all": {}},
+            "aggs": { "by_decade": {"histogram": {"field": "year", "interval": 10}} }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert!(matches!(req.aggs.get("by_decade"), Some(AggregationRequest::Histogram(_))));
+    }
+
+    #[test]
+    fn deserialize_aggregations_alias() {
+        let body = json!({
+            "query": {"match_all": {}},
+            "aggregations": { "g": {"terms": {"field": "genre"}} }
+        });
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.aggs.len(), 1, "'aggregations' should alias to 'aggs'");
+    }
+
+    #[test]
+    fn no_aggs_defaults_to_empty() {
+        let body = json!({"query": {"match_all": {}}});
+        let req: SearchRequest = serde_json::from_value(body).unwrap();
+        assert!(req.aggs.is_empty());
+    }
+
+    #[test]
+    fn multiple_aggregations_in_one_request() {
+        let hits = make_hits(vec![
+            json!({"genre": "scifi", "rating": 8.7}),
+            json!({"genre": "action", "rating": 9.0}),
+            json!({"genre": "scifi", "rating": 8.4}),
+        ]);
+        let mut aggs = HashMap::new();
+        aggs.insert("genres".into(), AggregationRequest::Terms(TermsAggParams { field: "genre".into(), size: 10 }));
+        aggs.insert("rating_stats".into(), AggregationRequest::Stats(MetricAggParams { field: "rating".into() }));
+
+        let result = compute_aggregations(&hits, &aggs);
+        let merged = merge_aggregations(vec![result], &aggs);
+        assert!(merged.contains_key("genres"));
+        assert!(merged.contains_key("rating_stats"));
+        assert_eq!(merged["rating_stats"]["count"], 3);
     }
 }
