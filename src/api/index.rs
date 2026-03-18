@@ -46,8 +46,36 @@ pub async fn create_index(
         return crate::api::error_response(StatusCode::INTERNAL_SERVER_ERROR, "no_data_nodes_exception", "No data nodes available to assign shards");
     }
 
-    let metadata = IndexMetadata::build_shard_routing(&index_name, num_shards, num_replicas, &data_nodes);
+    let mut metadata = IndexMetadata::build_shard_routing(&index_name, num_shards, num_replicas, &data_nodes);
+
+    // Parse field mappings: { "mappings": { "properties": { "title": { "type": "text" }, ... } } }
+    if let Some(properties) = settings.pointer("/mappings/properties").and_then(|v| v.as_object()) {
+        for (field_name, field_def) in properties {
+            if let Some(type_str) = field_def.get("type").and_then(|v| v.as_str()) {
+                let field_mapping = match type_str {
+                    "text" => Some(crate::cluster::state::FieldMapping { field_type: crate::cluster::state::FieldType::Text, dimension: None }),
+                    "keyword" => Some(crate::cluster::state::FieldMapping { field_type: crate::cluster::state::FieldType::Keyword, dimension: None }),
+                    "integer" | "long" => Some(crate::cluster::state::FieldMapping { field_type: crate::cluster::state::FieldType::Integer, dimension: None }),
+                    "float" | "double" => Some(crate::cluster::state::FieldMapping { field_type: crate::cluster::state::FieldType::Float, dimension: None }),
+                    "boolean" => Some(crate::cluster::state::FieldMapping { field_type: crate::cluster::state::FieldType::Boolean, dimension: None }),
+                    "knn_vector" => {
+                        let dim = field_def.get("dimension").and_then(|v| v.as_u64()).map(|d| d as usize);
+                        Some(crate::cluster::state::FieldMapping { field_type: crate::cluster::state::FieldType::KnnVector, dimension: dim })
+                    }
+                    _ => {
+                        tracing::warn!("Unknown field type '{}' for field '{}', skipping", type_str, field_name);
+                        None
+                    }
+                };
+                if let Some(fm) = field_mapping {
+                    metadata.mappings.insert(field_name.clone(), fm);
+                }
+            }
+        }
+    }
+
     let shard_assignment = metadata.shard_routing.clone();
+    let index_mappings = metadata.mappings.clone();
 
     // Write through Raft if available (leader only), otherwise fallback
     if let Some(ref raft) = state.raft {
@@ -68,7 +96,7 @@ pub async fn create_index(
     // Open local shard engines for shards assigned to this node (primary or replica)
     for (shard_id, routing) in &shard_assignment {
         if routing.primary == state.local_node_id || routing.replicas.contains(&state.local_node_id) {
-            if let Err(e) = state.shard_manager.open_shard(&index_name, *shard_id) {
+            if let Err(e) = state.shard_manager.open_shard_with_mappings(&index_name, *shard_id, &index_mappings) {
                 tracing::error!("Failed to open shard {} for {}: {}", shard_id, index_name, e);
             }
         }
@@ -121,6 +149,7 @@ pub async fn index_document(
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
+            mappings: HashMap::new(),
         };
         if let Some(ref raft) = state.raft {
             let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata: m.clone() };
@@ -188,6 +217,7 @@ pub async fn index_document_with_id(
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
+            mappings: HashMap::new(),
         };
         if let Some(ref raft) = state.raft {
             let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata: m.clone() };
@@ -328,6 +358,7 @@ pub async fn bulk_index(
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
+            mappings: HashMap::new(),
         };
         if let Some(ref raft) = state.raft {
             let cmd = crate::consensus::types::ClusterCommand::CreateIndex { metadata: m.clone() };

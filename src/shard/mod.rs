@@ -46,6 +46,16 @@ impl ShardManager {
     /// Open or create the engine for a specific shard.
     /// Uses CompositeEngine which handles both text and vector indexing.
     pub fn open_shard(&self, index: &str, shard_id: u32) -> Result<Arc<dyn SearchEngine>> {
+        self.open_shard_with_mappings(index, shard_id, &HashMap::new())
+    }
+
+    /// Open or create the engine for a specific shard with explicit field mappings.
+    pub fn open_shard_with_mappings(
+        &self,
+        index: &str,
+        shard_id: u32,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> Result<Arc<dyn SearchEngine>> {
         let key = ShardKey::new(index, shard_id);
         {
             let shards = self.shards.read().unwrap_or_else(|e| e.into_inner());
@@ -57,7 +67,7 @@ impl ShardManager {
         let shard_dir = self.data_dir.join(&key.data_dir());
         std::fs::create_dir_all(&shard_dir)?;
 
-        let engine = Arc::new(CompositeEngine::new(&shard_dir, self.refresh_interval)?);
+        let engine = Arc::new(CompositeEngine::new_with_mappings(&shard_dir, self.refresh_interval, mappings)?);
         CompositeEngine::start_refresh_loop(engine.clone());
 
         // Rebuild vector index from persisted documents (covers crash recovery)

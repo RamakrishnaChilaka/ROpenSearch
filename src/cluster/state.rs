@@ -35,6 +35,34 @@ pub struct ShardRoutingEntry {
     pub replicas: Vec<NodeId>,
 }
 
+/// The type of a mapped field in an index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldType {
+    /// Full-text analyzed field (tokenized, BM25 scored).
+    Text,
+    /// Exact-match keyword (not tokenized, stored verbatim).
+    Keyword,
+    /// Signed 64-bit integer.
+    Integer,
+    /// 64-bit floating point.
+    Float,
+    /// Boolean.
+    Boolean,
+    /// k-NN vector field (stored in USearch, not in Tantivy).
+    KnnVector,
+}
+
+/// A single field mapping definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldMapping {
+    #[serde(rename = "type")]
+    pub field_type: FieldType,
+    /// Dimension for knn_vector fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<usize>,
+}
+
 /// Metadata defining how an index is sharded across the cluster
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMetadata {
@@ -43,6 +71,9 @@ pub struct IndexMetadata {
     pub number_of_replicas: u32,
     /// Maps Shard ID → routing entry (primary + replicas)
     pub shard_routing: HashMap<u32, ShardRoutingEntry>,
+    /// Field name → mapping definition. Empty means dynamic (all-to-body).
+    #[serde(default)]
+    pub mappings: HashMap<String, FieldMapping>,
 }
 
 impl IndexMetadata {
@@ -76,6 +107,7 @@ impl IndexMetadata {
             number_of_shards: num_shards,
             number_of_replicas: num_replicas,
             shard_routing,
+            mappings: HashMap::new(),
         }
     }
 
@@ -273,6 +305,7 @@ mod tests {
             number_of_shards: 3,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         state.add_index(meta);
         assert_eq!(state.version, 1);
@@ -287,6 +320,7 @@ mod tests {
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
@@ -305,6 +339,7 @@ mod tests {
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
@@ -321,6 +356,7 @@ mod tests {
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
@@ -345,6 +381,7 @@ mod tests {
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
@@ -366,6 +403,7 @@ mod tests {
             number_of_shards: 1,
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
@@ -384,6 +422,7 @@ mod tests {
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         assert!(meta.replica_nodes(99).is_empty());
     }
@@ -395,6 +434,7 @@ mod tests {
             number_of_shards: 1,
             number_of_replicas: 2,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
@@ -422,6 +462,7 @@ mod tests {
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         assert!(!meta.promote_replica(99));
     }
@@ -433,6 +474,7 @@ mod tests {
             number_of_shards: 3,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
@@ -463,6 +505,7 @@ mod tests {
             number_of_shards: 1,
             number_of_replicas: 1,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         meta.shard_routing.insert(0, ShardRoutingEntry {
             primary: "node-A".into(),
@@ -474,5 +517,65 @@ mod tests {
         // Original routing unchanged
         assert_eq!(meta.shard_routing[&0].primary, "node-A");
         assert_eq!(meta.shard_routing[&0].replicas, vec!["node-B".to_string()]);
+    }
+
+    // ── Field mapping tests ────────────────────────────────────────────
+
+    #[test]
+    fn field_mapping_serde_roundtrip() {
+        let fm = FieldMapping { field_type: FieldType::Text, dimension: None };
+        let json = serde_json::to_string(&fm).unwrap();
+        let fm2: FieldMapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(fm2.field_type, FieldType::Text);
+        assert!(fm2.dimension.is_none());
+    }
+
+    #[test]
+    fn knn_vector_mapping_with_dimension() {
+        let fm = FieldMapping { field_type: FieldType::KnnVector, dimension: Some(128) };
+        let json = serde_json::to_string(&fm).unwrap();
+        assert!(json.contains("knn_vector"));
+        assert!(json.contains("128"));
+        let fm2: FieldMapping = serde_json::from_str(&json).unwrap();
+        assert_eq!(fm2.field_type, FieldType::KnnVector);
+        assert_eq!(fm2.dimension, Some(128));
+    }
+
+    #[test]
+    fn index_metadata_with_mappings_serde() {
+        let mut meta = IndexMetadata {
+            name: "test".into(),
+            number_of_shards: 1,
+            number_of_replicas: 0,
+            shard_routing: HashMap::new(),
+            mappings: HashMap::new(),
+        };
+        meta.mappings.insert("title".into(), FieldMapping { field_type: FieldType::Text, dimension: None });
+        meta.mappings.insert("year".into(), FieldMapping { field_type: FieldType::Integer, dimension: None });
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let meta2: IndexMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta2.mappings.len(), 2);
+        assert_eq!(meta2.mappings["title"].field_type, FieldType::Text);
+        assert_eq!(meta2.mappings["year"].field_type, FieldType::Integer);
+    }
+
+    #[test]
+    fn index_metadata_without_mappings_defaults_to_empty() {
+        let json = r#"{"name":"test","number_of_shards":1,"number_of_replicas":0,"shard_routing":{}}"#;
+        let meta: IndexMetadata = serde_json::from_str(json).unwrap();
+        assert!(meta.mappings.is_empty(), "missing mappings field should default to empty");
+    }
+
+    #[test]
+    fn all_field_types_deserialize() {
+        for type_str in &["text", "keyword", "integer", "float", "boolean", "knn_vector"] {
+            let json = format!(r#"{{"type":"{}"}}"#, type_str);
+            let fm: FieldMapping = serde_json::from_str(&json).unwrap();
+            assert!(matches!(fm.field_type,
+                FieldType::Text | FieldType::Keyword | FieldType::Integer |
+                FieldType::Float | FieldType::Boolean | FieldType::KnnVector
+            ));
+        }
     }
 }

@@ -305,7 +305,7 @@ config/            Default configuration
 - [x] Pre-filtering: apply bool/range filters before vector search
 
 ### Index Management
-- [ ] Field mappings in `PUT /{index}` (explicit schema definition)
+- [x] Field mappings in `PUT /{index}` (explicit schema definition)
 - [ ] Dynamic vs. strict mapping modes
 - [ ] Update document API (`POST /{index}/_update/{id}`)
 - [ ] Index aliases

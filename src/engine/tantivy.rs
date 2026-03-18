@@ -37,17 +37,41 @@ pub struct HotEngine {
 
 impl HotEngine {
     pub fn new<P: AsRef<Path>>(data_dir: P, refresh_interval: Duration) -> Result<Self> {
+        Self::new_with_mappings(data_dir, refresh_interval, &HashMap::new())
+    }
+
+    /// Create a new HotEngine with explicit field mappings.
+    /// When mappings are provided, named Tantivy fields are created for each mapped field.
+    /// The "body" catch-all is always created for backward compatibility with `?q=` queries.
+    pub fn new_with_mappings<P: AsRef<Path>>(
+        data_dir: P,
+        refresh_interval: Duration,
+        mappings: &HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref();
         let index_path = data_dir.join("index");
         std::fs::create_dir_all(&index_path)?;
 
         let mut schema_builder = Schema::builder();
-        // _id stores the document identifier (indexed for exact lookup/delete, not tokenized)
         let id_field = schema_builder.add_text_field("_id", STRING | STORED);
-        // _source stores the original JSON verbatim (STORED only — not searchable)
         let source_field = schema_builder.add_text_field("_source", STORED);
-        // Pre-create a catch-all "body" field for backward compat with simple query strings
         let body_field = schema_builder.add_text_field("body", TEXT | STORED);
+
+        // Create typed fields from mappings
+        let mut mapped_fields: HashMap<String, Field> = HashMap::new();
+        for (name, mapping) in mappings {
+            use crate::cluster::state::FieldType;
+            let field = match mapping.field_type {
+                FieldType::Text => schema_builder.add_text_field(name, TEXT | STORED),
+                FieldType::Keyword => schema_builder.add_text_field(name, STRING | STORED),
+                FieldType::Integer => schema_builder.add_i64_field(name, tantivy::schema::INDEXED | STORED),
+                FieldType::Float => schema_builder.add_f64_field(name, tantivy::schema::INDEXED | STORED),
+                FieldType::Boolean => schema_builder.add_text_field(name, STRING | STORED),
+                FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
+            };
+            mapped_fields.insert(name.clone(), field);
+        }
+
         let schema = schema_builder.build();
 
         let mmap_dir = tantivy::directory::MmapDirectory::open(&index_path)?;
@@ -56,9 +80,14 @@ impl HotEngine {
         // Rebuild field registry from persisted schema (handles restart)
         let mut fields = HashMap::new();
         fields.insert("body".to_string(), body_field);
+        // Merge in the mapped fields
+        for (name, field) in &mapped_fields {
+            fields.insert(name.clone(), *field);
+        }
+        // Also pick up any fields from the persisted schema (restart case)
         for (field, entry) in schema.fields() {
             let name = entry.name().to_string();
-            if name != "_source" && name != "_id" {
+            if name != "_source" && name != "_id" && !fields.contains_key(&name) {
                 fields.insert(name, field);
             }
         }
@@ -106,7 +135,9 @@ impl HotEngine {
     }
 
     /// Build a Tantivy document from a JSON object.
-    /// Stores _id, _source(raw JSON), and indexes text into the "body" catch-all.
+    /// When typed fields exist in the registry, values are indexed into their
+    /// proper field types. All text values also go into the "body" catch-all
+    /// for backward-compatible `?q=` query string searches.
     fn build_tantivy_doc(&self, doc_id: &str, payload: &serde_json::Value) -> TantivyDocument {
         let registry = self.field_registry.read().unwrap_or_else(|e| e.into_inner());
         let mut doc = TantivyDocument::new();
@@ -117,11 +148,36 @@ impl HotEngine {
         // Store the raw JSON in _source
         doc.add_text(registry.source_field, payload.to_string());
 
-        // Index each top-level string/number field into the "body" catch-all
         let body_field = *registry.fields.get("body").expect("body field must exist");
+
         if let Some(obj) = payload.as_object() {
             let mut body_parts = Vec::new();
-            for (_key, value) in obj {
+
+            for (key, value) in obj {
+                // If this field has a named Tantivy field, index into it by type
+                if let Some(&field) = registry.fields.get(key.as_str()) {
+                    if field != body_field {
+                        match value {
+                            serde_json::Value::String(s) => {
+                                doc.add_text(field, s);
+                            }
+                            serde_json::Value::Number(n) => {
+                                // Try to add as the field's native type
+                                if let Some(i) = n.as_i64() {
+                                    doc.add_i64(field, i);
+                                } else if let Some(f) = n.as_f64() {
+                                    doc.add_f64(field, f);
+                                }
+                            }
+                            serde_json::Value::Bool(b) => {
+                                doc.add_text(field, if *b { "true" } else { "false" });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Always add text representation to body catch-all
                 match value {
                     serde_json::Value::String(s) => body_parts.push(s.clone()),
                     serde_json::Value::Number(n) => body_parts.push(n.to_string()),
@@ -129,11 +185,11 @@ impl HotEngine {
                     _ => {}
                 }
             }
+
             if !body_parts.is_empty() {
                 doc.add_text(body_field, body_parts.join(" "));
             }
         } else {
-            // Not an object — store the whole thing as body
             doc.add_text(body_field, payload.to_string());
         }
 
@@ -1403,5 +1459,160 @@ mod tests {
         };
         let results = engine.search_query(&req).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    // ── Field mappings tests ────────────────────────────────────────────
+
+    fn create_engine_with_mappings(mappings: HashMap<String, crate::cluster::state::FieldMapping>) -> (tempfile::TempDir, HotEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HotEngine::new_with_mappings(dir.path(), Duration::from_secs(60), &mappings).unwrap();
+        (dir, engine)
+    }
+
+    #[test]
+    fn mapped_text_field_is_searchable_by_name() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert("title".to_string(), FieldMapping { field_type: FieldType::Text, dimension: None });
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine.add_document("d1", json!({"title": "rust programming"})).unwrap();
+        engine.add_document("d2", json!({"title": "python scripting"})).unwrap();
+        engine.refresh().unwrap();
+
+        // Match query on "title" field should hit the named text field, not just body
+        let req = SearchRequest {
+            query: QueryClause::Match({
+                let mut m = HashMap::new();
+                m.insert("title".to_string(), json!("rust"));
+                m
+            }),
+            size: 10, from: 0, knn: None,
+        };
+        let hits = engine.search_query(&req).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn mapped_keyword_field_supports_term_query() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert("status".to_string(), FieldMapping { field_type: FieldType::Keyword, dimension: None });
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine.add_document("d1", json!({"status": "published", "title": "a"})).unwrap();
+        engine.add_document("d2", json!({"status": "draft", "title": "b"})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Term({
+                let mut m = HashMap::new();
+                m.insert("status".to_string(), json!("published"));
+                m
+            }),
+            size: 10, from: 0, knn: None,
+        };
+        let hits = engine.search_query(&req).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "d1");
+    }
+
+    #[test]
+    fn mapped_integer_field_supports_range_query() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert("year".to_string(), FieldMapping { field_type: FieldType::Integer, dimension: None });
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine.add_document("d1", json!({"title": "old", "year": 1999})).unwrap();
+        engine.add_document("d2", json!({"title": "new", "year": 2024})).unwrap();
+        engine.add_document("d3", json!({"title": "mid", "year": 2010})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Range({
+                let mut m = HashMap::new();
+                m.insert("year".to_string(), crate::search::RangeCondition {
+                    gte: Some(json!(2010)),
+                    lt: None, lte: None, gt: None,
+                });
+                m
+            }),
+            size: 10, from: 0, knn: None,
+        };
+        let hits = engine.search_query(&req).unwrap();
+        assert_eq!(hits.len(), 2, "year >= 2010 should match d2 and d3");
+        let ids: Vec<&str> = hits.iter().map(|h| h["_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"d2"));
+        assert!(ids.contains(&"d3"));
+    }
+
+    #[test]
+    fn mapped_float_field_supports_range_query() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert("price".to_string(), FieldMapping { field_type: FieldType::Float, dimension: None });
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        engine.add_document("d1", json!({"title": "cheap", "price": 9.99})).unwrap();
+        engine.add_document("d2", json!({"title": "expensive", "price": 99.99})).unwrap();
+        engine.refresh().unwrap();
+
+        let req = SearchRequest {
+            query: QueryClause::Range({
+                let mut m = HashMap::new();
+                m.insert("price".to_string(), crate::search::RangeCondition {
+                    gt: Some(json!(50.0)),
+                    gte: None, lt: None, lte: None,
+                });
+                m
+            }),
+            size: 10, from: 0, knn: None,
+        };
+        let hits = engine.search_query(&req).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"], "d2");
+    }
+
+    #[test]
+    fn unmapped_fields_still_searchable_via_body() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert("title".to_string(), FieldMapping { field_type: FieldType::Text, dimension: None });
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        // "description" is not mapped — should still be searchable via body catch-all
+        engine.add_document("d1", json!({"title": "test", "description": "rust programming"})).unwrap();
+        engine.refresh().unwrap();
+
+        let hits = engine.search("rust").unwrap();
+        assert_eq!(hits.len(), 1, "unmapped field should be searchable via body");
+    }
+
+    #[test]
+    fn empty_mappings_behave_like_default_engine() {
+        let (_dir, engine) = create_engine_with_mappings(HashMap::new());
+        engine.add_document("d1", json!({"title": "hello world"})).unwrap();
+        engine.refresh().unwrap();
+
+        let hits = engine.search("hello").unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn knn_vector_mapping_is_skipped_in_tantivy_schema() {
+        use crate::cluster::state::{FieldMapping, FieldType};
+        let mut mappings = HashMap::new();
+        mappings.insert("embedding".to_string(), FieldMapping { field_type: FieldType::KnnVector, dimension: Some(3) });
+        mappings.insert("title".to_string(), FieldMapping { field_type: FieldType::Text, dimension: None });
+
+        let (_dir, engine) = create_engine_with_mappings(mappings);
+        // knn_vector should be ignored by Tantivy — no field created for it
+        engine.add_document("d1", json!({"title": "test", "embedding": [1.0, 0.0, 0.0]})).unwrap();
+        engine.refresh().unwrap();
+
+        let hits = engine.search("test").unwrap();
+        assert_eq!(hits.len(), 1, "doc should be searchable despite knn_vector field");
     }
 }

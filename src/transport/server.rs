@@ -93,6 +93,7 @@ pub fn proto_to_cluster_state(p: &ClusterState) -> crate::cluster::state::Cluste
             number_of_shards: idx.number_of_shards,
             number_of_replicas: idx.number_of_replicas,
             shard_routing,
+            mappings: std::collections::HashMap::new(),
         });
     }
     state
@@ -482,7 +483,12 @@ impl TransportService {
         if let Some(e) = self.shard_manager.get_shard(index_name, shard_id) {
             return Ok(e);
         }
-        self.shard_manager.open_shard(index_name, shard_id)
+        // Look up mappings from cluster state if available
+        let cs = self.cluster_manager.get_state();
+        let mappings = cs.indices.get(index_name)
+            .map(|m| m.mappings.clone())
+            .unwrap_or_default();
+        self.shard_manager.open_shard_with_mappings(index_name, shard_id, &mappings)
             .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
     }
 }
@@ -569,6 +575,7 @@ mod tests {
             number_of_shards: 2,
             number_of_replicas: 1,
             shard_routing,
+            mappings: std::collections::HashMap::new(),
         });
         cs.version = 42; // reset again after add_index
 
@@ -653,6 +660,7 @@ mod tests {
             number_of_shards: 1,
             number_of_replicas: 0,
             shard_routing,
+            mappings: std::collections::HashMap::new(),
         });
 
         let proto = cluster_state_to_proto(&cs);

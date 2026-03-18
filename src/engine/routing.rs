@@ -85,6 +85,7 @@ mod tests {
             number_of_shards: 2,
             number_of_replicas: 0,
             shard_routing,
+            mappings: std::collections::HashMap::new(),
         };
 
         let routed = route_document("some-doc", &meta);
@@ -100,6 +101,7 @@ mod tests {
             number_of_shards: 0,
             number_of_replicas: 0,
             shard_routing: HashMap::new(),
+            mappings: std::collections::HashMap::new(),
         };
         assert!(route_document("doc", &meta).is_none());
     }

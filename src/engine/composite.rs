@@ -26,8 +26,17 @@ pub struct CompositeEngine {
 impl CompositeEngine {
     /// Create a new composite engine at the given data directory.
     pub fn new(data_dir: impl AsRef<Path>, refresh_interval: Duration) -> Result<Self> {
+        Self::new_with_mappings(data_dir, refresh_interval, &std::collections::HashMap::new())
+    }
+
+    /// Create a new composite engine with explicit field mappings.
+    pub fn new_with_mappings(
+        data_dir: impl AsRef<Path>,
+        refresh_interval: Duration,
+        mappings: &std::collections::HashMap<String, crate::cluster::state::FieldMapping>,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        let text = HotEngine::new(&data_dir, refresh_interval)?;
+        let text = HotEngine::new_with_mappings(&data_dir, refresh_interval, mappings)?;
 
         // Load existing vector index if present
         let vector_path = data_dir.join("vectors.usearch");
