@@ -1788,3 +1788,108 @@ async fn recover_replica_ops_have_correct_fields() {
         assert!(!op.doc_id.is_empty(), "doc_id should not be empty");
     }
 }
+
+// ─── Shard Stats integration tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn get_shard_stats_returns_empty_when_no_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("integ-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm).await;
+    let mut client = connect_client(addr).await;
+
+    let resp = client
+        .get_shard_stats(tonic::Request::new(proto::ShardStatsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(resp.shards.is_empty());
+}
+
+#[tokio::test]
+async fn get_shard_stats_returns_doc_counts_for_open_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("integ-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index some docs into shard 0
+    for i in 0..5 {
+        let payload = serde_json::json!({"title": format!("doc-{}", i)});
+        let resp = client
+            .index_doc(tonic::Request::new(ShardDocRequest {
+                index_name: "stats-test".into(),
+                shard_id: 0,
+                doc_id: format!("doc-{}", i),
+                payload_json: serde_json::to_vec(&payload).unwrap(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.success, "index_doc failed: {}", resp.error);
+    }
+
+    refresh_all(&sm);
+
+    let resp = client
+        .get_shard_stats(tonic::Request::new(proto::ShardStatsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(resp.shards.len(), 1);
+    assert_eq!(resp.shards[0].index_name, "stats-test");
+    assert_eq!(resp.shards[0].shard_id, 0);
+    assert_eq!(resp.shards[0].doc_count, 5);
+}
+
+#[tokio::test]
+async fn get_shard_stats_returns_multiple_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let cm = Arc::new(ClusterManager::new("integ-test".into()));
+    let sm = Arc::new(ShardManager::new(dir.path(), Duration::from_secs(60)));
+
+    let addr = start_grpc_server(cm, sm.clone()).await;
+    let mut client = connect_client(addr).await;
+
+    // Index docs into two different shards on same index
+    for shard in [0, 1] {
+        let count = if shard == 0 { 3 } else { 7 };
+        for i in 0..count {
+            let payload = serde_json::json!({"n": i});
+            let resp = client
+                .index_doc(tonic::Request::new(ShardDocRequest {
+                    index_name: "multi-shard".into(),
+                    shard_id: shard,
+                    doc_id: format!("s{}-doc-{}", shard, i),
+                    payload_json: serde_json::to_vec(&payload).unwrap(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(resp.success);
+        }
+    }
+
+    refresh_all(&sm);
+
+    let resp = client
+        .get_shard_stats(tonic::Request::new(proto::ShardStatsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(resp.shards.len(), 2);
+
+    let mut by_shard: HashMap<u32, u64> = HashMap::new();
+    for s in &resp.shards {
+        by_shard.insert(s.shard_id, s.doc_count);
+    }
+    assert_eq!(by_shard[&0], 3);
+    assert_eq!(by_shard[&1], 7);
+}

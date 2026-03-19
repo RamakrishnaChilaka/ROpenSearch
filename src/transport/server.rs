@@ -1099,6 +1099,24 @@ impl InternalTransport for TransportService {
         }))
     }
 
+    // ─── Shard Stats ──────────────────────────────────────────────────────────
+
+    async fn get_shard_stats(
+        &self,
+        _request: Request<ShardStatsRequest>,
+    ) -> Result<Response<ShardStatsResponse>, Status> {
+        let all = self.shard_manager.all_shards();
+        let shards = all
+            .iter()
+            .map(|(key, engine)| ShardStat {
+                index_name: key.index.clone(),
+                shard_id: key.shard_id,
+                doc_count: engine.doc_count(),
+            })
+            .collect();
+        Ok(Response::new(ShardStatsResponse { shards }))
+    }
+
     // ─── Raft RPCs ────────────────────────────────────────────────────────────
 
     async fn raft_vote(

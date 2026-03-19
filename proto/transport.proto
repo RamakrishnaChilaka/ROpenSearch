@@ -237,6 +237,20 @@ message TransferMasterResponse {
     string error = 2;
 }
 
+// ─── Shard Stats (for _cat endpoints) ───────────────────────────────────────
+
+message ShardStatsRequest {}
+
+message ShardStat {
+    string index_name = 1;
+    uint32 shard_id = 2;
+    uint64 doc_count = 3;
+}
+
+message ShardStatsResponse {
+    repeated ShardStat shards = 1;
+}
+
 // ─── Service Definition ─────────────────────────────────────────────────────
 
 service InternalTransport {
@@ -271,6 +285,9 @@ service InternalTransport {
 
     // Cluster management (forwarded to leader)
     rpc TransferMaster(TransferMasterRequest) returns (TransferMasterResponse);
+
+    // Shard stats (for _cat endpoints)
+    rpc GetShardStats(ShardStatsRequest) returns (ShardStatsResponse);
 
     // Raft consensus RPCs
     rpc RaftVote(RaftRequest) returns (RaftReply);

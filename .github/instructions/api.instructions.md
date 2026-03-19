@@ -50,7 +50,11 @@ pub fn error_response(
 | GET | `/_cat/shards` | `cat_shards()` | Shard allocation (prirep=p/r, state, docs, node) |
 | GET | `/_cat/indices` | `cat_indices()` | Index listing (health, shards, docs) |
 | GET | `/_cat/master` | `cat_master()` | Current master node |
+### Cat Endpoint Doc Count Collection
+By default, `_cat/shards` and `_cat/indices` **fan out to all nodes** via gRPC `GetShardStats` to collect real doc counts (mirrors OpenSearch behavior). This ensures every shard row shows accurate doc counts regardless of which node is queried.
 
+- **`?local`**: Falls back to local-only doc counts — shows counts for shards hosted on this node, `-` for remote shards. Useful for debugging or reducing overhead.
+- The fan-out uses concurrent `tokio::spawn` for each remote node, with graceful degradation (failed RPCs are silently skipped, showing `0`).
 ### Index Management — src/api/index.rs (Raft writes → forward to leader)
 | HTTP | Path | Handler |
 |------|------|---------|
