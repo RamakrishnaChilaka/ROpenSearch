@@ -20,6 +20,7 @@ Uses opensearch-py helpers.bulk with chunked batches of 5000 docs.
 import argparse
 import hashlib
 import random
+import statistics
 import string
 import time
 
@@ -123,6 +124,7 @@ def main():
     ingested = 0
     bytes_sent = 0
     errors_total = 0
+    batch_latencies = []
 
     def doc_generator():
         for i in range(total_docs):
@@ -132,8 +134,11 @@ def main():
     for doc in doc_generator():
         batch.append(doc)
         if len(batch) >= args.batch_size:
+            batch_start = time.perf_counter()
             try:
                 success, errs = helpers.bulk(client, batch, raise_on_error=False)
+                batch_ms = (time.perf_counter() - batch_start) * 1000
+                batch_latencies.append(batch_ms)
                 ingested += success
                 if isinstance(errs, list):
                     errors_total += len(errs)
@@ -141,6 +146,8 @@ def main():
                     errors_total += errs
                 bytes_sent += len(batch) * DOC_SIZE_BYTES
             except Exception as e:
+                batch_ms = (time.perf_counter() - batch_start) * 1000
+                batch_latencies.append(batch_ms)
                 print(f"\nBulk error at doc {ingested}: {e}")
                 errors_total += len(batch)
 
@@ -159,14 +166,19 @@ def main():
 
     # Final batch
     if batch:
+        batch_start = time.perf_counter()
         try:
             success, errs = helpers.bulk(client, batch, raise_on_error=False)
+            batch_ms = (time.perf_counter() - batch_start) * 1000
+            batch_latencies.append(batch_ms)
             ingested += success
             if isinstance(errs, list):
                 errors_total += len(errs)
             else:
                 errors_total += errs
         except Exception as e:
+            batch_ms = (time.perf_counter() - batch_start) * 1000
+            batch_latencies.append(batch_ms)
             print(f"\nFinal bulk error: {e}")
             errors_total += len(batch)
 
@@ -180,6 +192,24 @@ def main():
     print(f"  Data:      ~{mb_total:,.0f} MB")
     print(f"  Time:      {elapsed:.1f}s")
     print(f"  Rate:      {rate:,.0f} docs/s")
+
+    if batch_latencies:
+        batch_latencies.sort()
+        num_batches = len(batch_latencies)
+        def pct(p):
+            k = (num_batches - 1) * (p / 100)
+            f = int(k)
+            c = min(f + 1, num_batches - 1)
+            return batch_latencies[f] + (k - f) * (batch_latencies[c] - batch_latencies[f])
+
+        print(f"\n  Bulk batch latency ({num_batches:,} batches of {args.batch_size} docs):")
+        print(f"    Min:  {batch_latencies[0]:>8.1f} ms")
+        print(f"    Avg:  {statistics.mean(batch_latencies):>8.1f} ms")
+        print(f"    p50:  {pct(50):>8.1f} ms")
+        print(f"    p95:  {pct(95):>8.1f} ms")
+        print(f"    p99:  {pct(99):>8.1f} ms")
+        print(f"    Max:  {batch_latencies[-1]:>8.1f} ms")
+
     print(f"{'=' * 60}")
 
     # Refresh and verify count

@@ -20,7 +20,7 @@
 
 FerrisSearch is a lightweight, Rust-native search engine with OpenSearch-compatible REST APIs. Built for teams that want the familiar OpenSearch interface with the performance and safety of Rust.
 
-> **⚡ Performance:** 2M documents, 10K queries, **p50 = 29.8ms**, 105 queries/sec, zero errors — [see benchmarks](#benchmarks)
+> **⚡ Performance:** 2M documents — ingestion at **8,669 docs/sec**, search at **p50 = 29.8ms**, zero errors — [see benchmarks](#benchmarks)
 
 ## Highlights
 
@@ -400,6 +400,27 @@ Single-node, 2M documents (~1 GB), 3 shards, 0 replicas.
 
 **Environment:** AMD EPYC 7763 (8 cores / 16 threads), 32 GB RAM, Ubuntu 24.04 (WSL2)
 
+### Ingestion
+
+2,000,000 documents (~954 MB) via `opensearch-py` bulk API in batches of 5,000 docs.
+
+| Metric | Value |
+|--------|-------|
+| Documents | 2,000,000 |
+| Errors | 0 |
+| Total time | 230.7s |
+| Throughput | **8,669 docs/sec** |
+
+**Bulk batch latency (400 batches × 5,000 docs):**
+
+| Min | Avg | p50 | p95 | p99 | Max |
+|-----|-----|-----|-----|-----|-----|
+| 322.6ms | 464.7ms | 411.5ms | 749.4ms | 914.5ms | 1317.5ms |
+
+### Search
+
+10,000 queries across 20 query types, concurrency = 4.
+
 ```
 Query Type                 Count  Err      Min      Avg      p50      p95      p99      Max   Hits/q
 ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -431,8 +452,9 @@ TOTAL                      10000    0     2.3ms    37.3ms    29.8ms   102.6ms   
 
 Reproduce with:
 ```bash
-/tmp/ferris-venv/bin/python3 scripts/ingest_1gb.py        # populate 2M docs
-/tmp/ferris-venv/bin/python3 scripts/search_1gb.py --queries 500 --concurrency 4
+pip install opensearch-py
+python3 scripts/ingest_1gb.py                              # populate 2M docs
+python3 scripts/search_1gb.py --queries 500 --concurrency 4 # run search benchmark
 ```
 
 ## Project Structure
