@@ -72,22 +72,21 @@ impl HotEngine {
         for name in mapping_names {
             let mapping = &mappings[&name];
             use crate::cluster::state::FieldType;
-            let field = match mapping.field_type {
-                FieldType::Text => schema_builder.add_text_field(&name, TEXT | STORED),
-                FieldType::Keyword => {
-                    schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
-                }
-                FieldType::Integer => {
-                    schema_builder.add_i64_field(&name, tantivy::schema::INDEXED | STORED | FAST)
-                }
-                FieldType::Float => {
-                    schema_builder.add_f64_field(&name, tantivy::schema::INDEXED | STORED | FAST)
-                }
-                FieldType::Boolean => {
-                    schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
-                }
-                FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
-            };
+            let field =
+                match mapping.field_type {
+                    FieldType::Text => schema_builder.add_text_field(&name, TEXT | STORED),
+                    FieldType::Keyword => {
+                        schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
+                    }
+                    FieldType::Integer => schema_builder
+                        .add_i64_field(&name, tantivy::schema::INDEXED | STORED | FAST),
+                    FieldType::Float => schema_builder
+                        .add_f64_field(&name, tantivy::schema::INDEXED | STORED | FAST),
+                    FieldType::Boolean => {
+                        schema_builder.add_text_field(&name, (STRING | STORED).set_fast(None))
+                    }
+                    FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
+                };
             mapped_fields.insert(name, field);
         }
 
@@ -334,7 +333,10 @@ impl HotEngine {
         writer.commit()?;
         self.reader.reload()?;
         self.persist_committed_next_seq_no(
-            entries.last().map(|entry| entry.seq_no + 1).unwrap_or(committed_next_seq),
+            entries
+                .last()
+                .map(|entry| entry.seq_no + 1)
+                .unwrap_or(committed_next_seq),
         )?;
 
         tracing::info!(
@@ -1801,7 +1803,10 @@ mod tests {
             aggs: HashMap::new(),
         };
         let (_hits, total, _) = engine2.search_query(&req).unwrap();
-        assert_eq!(total, 2, "reopen should keep committed docs and replay only pending ones");
+        assert_eq!(
+            total, 2,
+            "reopen should keep committed docs and replay only pending ones"
+        );
         assert!(engine2.get_document("committed").unwrap().is_some());
         assert!(engine2.get_document("pending").unwrap().is_some());
     }
@@ -1866,7 +1871,10 @@ mod tests {
         .unwrap();
 
         let doc = reopened.get_document("stable").unwrap();
-        assert!(doc.is_some(), "document should survive reopen with reordered mappings");
+        assert!(
+            doc.is_some(),
+            "document should survive reopen with reordered mappings"
+        );
         assert_eq!(doc.unwrap()["title"], "schema order");
     }
 

@@ -22,7 +22,12 @@ pub(crate) fn ensure_local_index_shards_open(
                 .replicas
                 .iter()
                 .any(|node_id| node_id == &state.local_node_id);
-        if !assigned_here || state.shard_manager.get_shard(index_name, *shard_id).is_some() {
+        if !assigned_here
+            || state
+                .shard_manager
+                .get_shard(index_name, *shard_id)
+                .is_some()
+        {
             continue;
         }
 
@@ -1152,8 +1157,7 @@ pub async fn search_documents_dsl(
         std::collections::HashMap<String, crate::search::PartialAggResult>,
     > = Vec::new();
 
-    let local_shards =
-        ensure_local_index_shards_open(&state, &index_name, &metadata, "DSL search");
+    let local_shards = ensure_local_index_shards_open(&state, &index_name, &metadata, "DSL search");
 
     // Query local shards directly (text search)
     for (shard_id, engine) in &local_shards {

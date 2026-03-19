@@ -185,9 +185,7 @@ impl InternalTransport for TransportService {
                     .await
                     .map_err(|e| Status::internal(format!("Raft AddNode failed: {}", e)))?;
 
-                let voters: std::collections::BTreeSet<u64> = raft
-                    .voter_ids()
-                    .collect();
+                let voters: std::collections::BTreeSet<u64> = raft.voter_ids().collect();
                 let already_voter = voters.contains(&joining_raft_id);
 
                 if !already_voter {
@@ -1238,12 +1236,8 @@ impl TransportService {
         }
         let cs = self.cluster_manager.get_state();
         let metadata = cs.indices.get(index_name);
-        let mappings = metadata
-            .map(|m| m.mappings.clone())
-            .unwrap_or_default();
-        let settings = metadata
-            .map(|m| m.settings.clone())
-            .unwrap_or_default();
+        let mappings = metadata.map(|m| m.mappings.clone()).unwrap_or_default();
+        let settings = metadata.map(|m| m.settings.clone()).unwrap_or_default();
         self.shard_manager
             .open_shard_with_settings(index_name, shard_id, &mappings, &settings)
             .map_err(|e| Status::internal(format!("Failed to open shard: {}", e)))
@@ -1302,7 +1296,11 @@ impl TransportService {
             }
 
             for shard_id in metadata.shard_routing.keys() {
-                if self.shard_manager.get_shard(index_name, *shard_id).is_some() {
+                if self
+                    .shard_manager
+                    .get_shard(index_name, *shard_id)
+                    .is_some()
+                {
                     continue;
                 }
 

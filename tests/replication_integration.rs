@@ -743,7 +743,11 @@ async fn search_shard_reopens_persisted_shard_after_restart() {
         .into_inner();
 
     assert!(resp.success, "restart search failed: {}", resp.error);
-    assert_eq!(resp.hits.len(), 1, "expected reopened shard to return 1 hit");
+    assert_eq!(
+        resp.hits.len(),
+        1,
+        "expected reopened shard to return 1 hit"
+    );
     let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
     assert_eq!(hit["_id"], "d1");
 }
@@ -846,7 +850,11 @@ async fn search_shard_dsl_reopens_persisted_shard_after_restart() {
         .into_inner();
 
     assert!(resp.success, "restart DSL search failed: {}", resp.error);
-    assert_eq!(resp.hits.len(), 1, "expected reopened shard to return 1 hit");
+    assert_eq!(
+        resp.hits.len(),
+        1,
+        "expected reopened shard to return 1 hit"
+    );
     let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
     assert_eq!(hit["_id"], "d1");
 }
@@ -877,7 +885,10 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
             .open_shard_with_mappings("restart-mapped-idx", 0, &mappings)
             .unwrap();
         engine
-            .add_document("d1", serde_json::json!({"title": "schema order", "category": "stable"}))
+            .add_document(
+                "d1",
+                serde_json::json!({"title": "schema order", "category": "stable"}),
+            )
             .unwrap();
         engine.refresh().unwrap();
     }
@@ -944,7 +955,11 @@ async fn search_shard_dsl_reopens_mapped_shard_with_reordered_metadata_after_res
         "restart mapped DSL search failed after reordered metadata: {}",
         resp.error
     );
-    assert_eq!(resp.hits.len(), 1, "expected reopened mapped shard to return 1 hit");
+    assert_eq!(
+        resp.hits.len(),
+        1,
+        "expected reopened mapped shard to return 1 hit"
+    );
     let hit: serde_json::Value = serde_json::from_slice(&resp.hits[0].source_json).unwrap();
     assert_eq!(hit["_id"], "d1");
 }
@@ -958,7 +973,10 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
         std::fs::create_dir_all(&shard_dir).unwrap();
         let engine = CompositeEngine::new(&shard_dir, Duration::from_secs(60)).unwrap();
         engine
-            .add_document("d1", serde_json::json!({"title": "committed before restart"}))
+            .add_document(
+                "d1",
+                serde_json::json!({"title": "committed before restart"}),
+            )
             .unwrap();
         engine.refresh().unwrap();
         engine
@@ -986,7 +1004,11 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
         .unwrap()
         .into_inner();
 
-    assert!(resp.success, "restart replay DSL search failed: {}", resp.error);
+    assert!(
+        resp.success,
+        "restart replay DSL search failed: {}",
+        resp.error
+    );
     assert_eq!(
         resp.hits.len(),
         2,
@@ -997,8 +1019,7 @@ async fn search_shard_dsl_restart_replays_only_uncommitted_entries_after_refresh
         .hits
         .iter()
         .map(|hit| {
-            serde_json::from_slice::<serde_json::Value>(&hit.source_json)
-                .unwrap()["_id"]
+            serde_json::from_slice::<serde_json::Value>(&hit.source_json).unwrap()["_id"]
                 .as_str()
                 .unwrap()
                 .to_string()

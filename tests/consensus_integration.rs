@@ -976,7 +976,10 @@ async fn grpc_join_cluster_refreshes_existing_voter_registration() {
 
     {
         let state = state_handle.read().unwrap();
-        let node = state.nodes.get("node-1").expect("node-1 should be re-registered");
+        let node = state
+            .nodes
+            .get("node-1")
+            .expect("node-1 should be re-registered");
         assert_eq!(node.transport_port, 19370);
         assert_eq!(node.http_port, 19270);
         assert_eq!(node.raft_node_id, 1);
@@ -987,7 +990,10 @@ async fn grpc_join_cluster_refreshes_existing_voter_registration() {
         .await
         .unwrap()
         .into_inner();
-    assert!(second.state.is_some(), "repeat join should remain idempotent");
+    assert!(
+        second.state.is_some(),
+        "repeat join should remain idempotent"
+    );
 
     let state = state_handle.read().unwrap();
     assert!(state.nodes.contains_key("node-1"));
