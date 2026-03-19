@@ -47,9 +47,9 @@ async fn collect_shard_doc_counts(state: &AppState) -> HashMap<(String, u32), u6
         }
         let client = state.transport_client.clone();
         let node = node.clone();
-        handles.push(tokio::spawn(async move {
-            client.get_shard_stats(&node).await
-        }));
+        handles.push(tokio::spawn(
+            async move { client.get_shard_stats(&node).await },
+        ));
     }
     for handle in handles {
         if let Ok(Ok(remote_counts)) = handle.await {
