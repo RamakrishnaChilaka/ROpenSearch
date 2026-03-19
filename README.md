@@ -20,7 +20,7 @@
 
 FerrisSearch is a lightweight, Rust-native search engine with OpenSearch-compatible REST APIs. Built for teams that want the familiar OpenSearch interface with the performance and safety of Rust.
 
-> **⚡ Performance:** 2M documents — ingestion at **8,669 docs/sec**, search at **p50 = 27.8ms**, zero errors — [see benchmarks](#benchmarks)
+> **⚡ Performance:** 2M documents — ingestion at **8,765 docs/sec**, search at **p50 = 23.0ms**, zero errors — [see benchmarks](#benchmarks)
 
 ## Highlights
 
@@ -396,7 +396,7 @@ Integration tests run entirely in-process — they spin up real gRPC servers wit
 
 ## Benchmarks
 
-Single-node, 2M documents (~1 GB), 3 shards, 0 replicas.
+3-node cluster (single dev box), 2M documents (~1 GB), 3 shards, 0 replicas.
 
 **Environment:** AMD EPYC 7763 (8 cores / 16 threads), 32 GB RAM, Ubuntu 24.04 (WSL2)
 
@@ -408,14 +408,14 @@ Single-node, 2M documents (~1 GB), 3 shards, 0 replicas.
 |--------|-------|
 | Documents | 2,000,000 |
 | Errors | 0 |
-| Total time | 230.7s |
-| Throughput | **8,669 docs/sec** |
+| Total time | 228.2s |
+| Throughput | **8,765 docs/sec** |
 
 **Bulk batch latency (400 batches × 5,000 docs):**
 
 | Min | Avg | p50 | p95 | p99 | Max |
 |-----|-----|-----|-----|-----|-----|
-| 322.6ms | 464.7ms | 411.5ms | 749.4ms | 914.5ms | 1317.5ms |
+| 322.0ms | 460.2ms | 397.4ms | 793.3ms | 1020.3ms | 1655.8ms |
 
 ### Search
 
@@ -448,7 +448,7 @@ wildcard_title               500    0     6.2ms     9.9ms     8.4ms    14.7ms   
 TOTAL                      10000    0     5.8ms    39.7ms    27.8ms   205.3ms   251.5ms   314.1ms
 ```
 
-**10,000 queries | 0 errors | 99 queries/sec | p50 = 27.8ms | concurrency = 4**
+**10,000 queries | 0 errors | 165 queries/sec | p50 = 23.0ms | concurrency = 4**
 
 Reproduce with:
 ```bash

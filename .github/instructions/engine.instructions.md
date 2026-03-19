@@ -79,6 +79,16 @@ wal: Option<Arc<dyn WriteAheadLog>>    // per-shard WAL
 - `matching_doc_ids(clause)` — returns doc ID set for k-NN pre-filtering
 - `replay_translog()` — crash recovery from WAL
 
+### Field Schema Flags
+Numeric fields use three Tantivy flags (mirrors OpenSearch default doc_values: true):
+- INDEXED - inverted index, enables search queries (term/range/match)
+- STORED - preserves original value, retrievable in results
+- FAST - columnar storage, critical for range queries, sorting, and aggregations
+
+Integer and Float fields get all three: INDEXED | STORED | FAST.
+Without FAST, range queries scan the inverted index (slow on high-cardinality fields).
+With FAST, Tantivy reads a columnar structure - orders of magnitude faster.
+
 ### Type-Safe Term Creation (CRITICAL)
 All Tantivy `Term` objects MUST match the schema field type. A type mismatch (e.g., `i64` term
 on an `f64` field) causes **silent 0-hit results** — Tantivy won't error, just returns nothing.
