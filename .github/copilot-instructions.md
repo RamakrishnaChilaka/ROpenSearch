@@ -43,6 +43,11 @@ Uses **Tantivy** for full-text search and **openraft 0.10.0-alpha.17** for Raft 
 - `MemLogStore::get_log_reader()` must return a shared-state handle (not a clone) because the SM worker holds the reader permanently
 - `raft.add_learner(node_id, BasicNode { addr }, blocking)` then `raft.change_membership(voter_set, false)` to add nodes
 
+## Tantivy Field Schema Flags
+- Numeric fields (Integer, Float) use INDEXED | STORED | FAST (mirrors OpenSearch default doc_values: true)
+- FAST enables columnar storage - critical for range queries, sorting, and aggregations
+- Without FAST, range queries scan the inverted index (orders of magnitude slower on high-cardinality fields)
+
 ## Tantivy Type Safety Gotchas
 - **NEVER** create `Term` objects directly with `Term::from_field_text/i64/f64` in query building — always use `self.typed_term(field, value)` which checks the schema field type
 - JSON integer `10` on a float field: `serde_json::Number::as_i64()` succeeds before `as_f64()`, creating an `i64` term on an `f64` field → silent 0-hit results. `typed_term()` prevents this.

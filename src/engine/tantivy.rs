@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
+use tantivy::schema::{FAST, Field, STORED, STRING, Schema, TEXT, Value};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use super::SearchEngine;
@@ -71,10 +71,10 @@ impl HotEngine {
                 FieldType::Text => schema_builder.add_text_field(name, TEXT | STORED),
                 FieldType::Keyword => schema_builder.add_text_field(name, STRING | STORED),
                 FieldType::Integer => {
-                    schema_builder.add_i64_field(name, tantivy::schema::INDEXED | STORED)
+                    schema_builder.add_i64_field(name, tantivy::schema::INDEXED | STORED | FAST)
                 }
                 FieldType::Float => {
-                    schema_builder.add_f64_field(name, tantivy::schema::INDEXED | STORED)
+                    schema_builder.add_f64_field(name, tantivy::schema::INDEXED | STORED | FAST)
                 }
                 FieldType::Boolean => schema_builder.add_text_field(name, STRING | STORED),
                 FieldType::KnnVector => continue, // vectors are in USearch, not Tantivy
