@@ -30,6 +30,9 @@ CreateIndex(CreateIndexRequest) → CreateIndexResponse
 DeleteIndex(DeleteIndexRequest) → DeleteIndexResponse
 TransferMaster(TransferMasterRequest) → TransferMasterResponse
 
+// Shard stats (for _cat endpoints)
+GetShardStats(ShardStatsRequest) → ShardStatsResponse
+
 // Raft consensus (opaque JSON payloads)
 RaftVote(RaftRequest) → RaftReply
 RaftAppendEntries(RaftRequest) → RaftReply
@@ -83,6 +86,7 @@ pub struct TransportClient {
 | `forward_bulk_to_shard()` | Route bulk write to shard primary — returns `Err` on shard failure |
 | `forward_search_to_shard()` | Scatter search to remote shard |
 | `forward_search_dsl_to_shard()` | Scatter DSL search to remote shard |
+| `get_shard_stats()` | Collect shard doc counts from remote node |
 | `replicate_to_shard()` | Primary → replica single write |
 | `replicate_bulk_to_shard()` | Primary → replica batch write |
 | `recover_replica()` | Request missed ops from primary's WAL |

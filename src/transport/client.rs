@@ -524,6 +524,29 @@ impl TransportClient {
         }
         Ok(())
     }
+
+    /// Fetch shard doc counts from a remote node.
+    /// Returns a map of (index_name, shard_id) → doc_count.
+    pub async fn get_shard_stats(
+        &self,
+        node: &NodeInfo,
+    ) -> Result<HashMap<(String, u32), u64>, anyhow::Error> {
+        let mut client = self
+            .connect(&node.host, node.transport_port)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to {}: {}", node.id, e))?;
+        let resp = client
+            .get_shard_stats(tonic::Request::new(ShardStatsRequest {}))
+            .await
+            .map_err(|e| anyhow::anyhow!("GetShardStats RPC to {}: {}", node.id, e))?;
+        let inner = resp.into_inner();
+        let map = inner
+            .shards
+            .into_iter()
+            .map(|s| ((s.index_name, s.shard_id), s.doc_count))
+            .collect();
+        Ok(map)
+    }
 }
 
 /// Result of a recovery request from the primary.

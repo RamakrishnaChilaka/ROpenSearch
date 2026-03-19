@@ -11,6 +11,7 @@
 <p align="center">
   <a href="#getting-started">Getting Started</a> &middot;
   <a href="#api-reference">API Reference</a> &middot;
+  <a href="#benchmarks">Benchmarks</a> &middot;
   <a href="#replication">Replication</a> &middot;
   <a href="#testing">Testing</a>
 </p>
@@ -18,6 +19,8 @@
 ---
 
 FerrisSearch is a lightweight, Rust-native search engine with OpenSearch-compatible REST APIs. Built for teams that want the familiar OpenSearch interface with the performance and safety of Rust.
+
+> **⚡ Performance:** 2M documents, 10K queries, **p50 = 29.8ms**, 105 queries/sec, zero errors — [see benchmarks](#benchmarks)
 
 ## Highlights
 
@@ -390,6 +393,47 @@ cargo test --test replication_integration        # Replication tests (31)
 ```
 
 Integration tests run entirely in-process — they spin up real gRPC servers with isolated temp directories. No external services needed.
+
+## Benchmarks
+
+Single-node, 2M documents (~1 GB), 3 shards, 0 replicas.
+
+**Environment:** AMD EPYC 7763 (8 cores / 16 threads), 32 GB RAM, Ubuntu 24.04 (WSL2)
+
+```
+Query Type                 Count  Err      Min      Avg      p50      p95      p99      Max   Hits/q
+────────────────────────────────────────────────────────────────────────────────────────────────────
+agg_filtered                 500    0     7.0ms    21.1ms    15.3ms    53.5ms    76.4ms   157.4ms  250009
+agg_histogram_price          500    0    21.1ms    42.9ms    37.3ms    78.7ms   113.2ms   184.6ms 2000000
+agg_stats_price              500    0    21.0ms    43.6ms    36.6ms    81.5ms   121.9ms   181.1ms 2000000
+agg_terms_category           500    0    21.8ms    44.0ms    38.0ms    80.6ms   112.3ms   257.9ms 2000000
+bool_filter_range            500    0    24.9ms    83.4ms    80.0ms   139.8ms   171.4ms   331.9ms   21524
+bool_must                    500    0     9.9ms    25.4ms    18.2ms    60.6ms    85.8ms   236.9ms   72868
+bool_should                  500    0     7.3ms    24.6ms    18.4ms    64.6ms    88.5ms   149.8ms  368283
+complex_bool                 500    0     2.3ms    12.7ms     8.3ms    41.9ms    70.2ms    92.6ms       0
+fuzzy_title                  500    0     6.4ms    19.7ms    15.2ms    49.5ms    79.2ms   135.2ms  104241
+match_all                    500    0    21.5ms    41.7ms    37.1ms    71.4ms    97.9ms   115.2ms 2000000
+match_description            500    0    20.5ms    39.3ms    33.6ms    68.9ms    98.8ms   136.8ms 1715482
+match_title                  500    0     6.6ms    19.4ms    13.9ms    47.7ms    84.8ms   122.6ms  120811
+paginated                    500    0    12.6ms    51.2ms    50.2ms    90.5ms   115.2ms   151.2ms 1245920
+prefix_title                 500    0     6.7ms    20.7ms    14.9ms    57.2ms    75.2ms   128.9ms  130881
+range_price                  500    0    40.5ms   112.5ms   110.3ms   181.0ms   212.1ms   406.7ms  507869
+range_rating                 500    0    15.6ms    40.5ms    36.7ms    72.3ms   106.4ms   289.6ms 1391549
+sort_price_asc               500    0    21.9ms    42.5ms    37.6ms    77.7ms    96.0ms   184.5ms 2000000
+sort_rating_desc             500    0     6.9ms    19.9ms    14.7ms    53.4ms    71.1ms   104.0ms  136147
+term_category                500    0     6.9ms    20.8ms    16.0ms    52.2ms    79.2ms   131.2ms  249999
+wildcard_title               500    0     6.1ms    20.7ms    15.3ms    54.1ms    78.0ms   110.2ms  123724
+────────────────────────────────────────────────────────────────────────────────────────────────────
+TOTAL                      10000    0     2.3ms    37.3ms    29.8ms   102.6ms   151.9ms   406.7ms
+```
+
+**10,000 queries | 0 errors | 105 queries/sec | p50 = 29.8ms | concurrency = 4**
+
+Reproduce with:
+```bash
+/tmp/ferris-venv/bin/python3 scripts/ingest_1gb.py        # populate 2M docs
+/tmp/ferris-venv/bin/python3 scripts/search_1gb.py --queries 500 --concurrency 4
+```
 
 ## Project Structure
 

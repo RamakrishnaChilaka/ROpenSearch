@@ -4,18 +4,69 @@ use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fmt::Write;
 
 #[derive(Deserialize, Default)]
 pub struct CatParams {
     #[serde(default)]
     pub v: Option<String>,
+    /// When present (`?local`), only show doc counts from local shards (no fan-out).
+    #[serde(default)]
+    pub local: Option<String>,
 }
 
 /// Returns true when the `v` (verbose/header) flag is present in the query string.
 /// Matches OpenSearch behaviour: `?v`, `?v=`, and `?v=true` all enable headers.
 fn wants_headers(params: &CatParams) -> bool {
     params.v.is_some()
+}
+
+fn wants_local(params: &CatParams) -> bool {
+    params.local.is_some()
+}
+
+/// Collect doc counts for all shards across the cluster.
+/// Fans out to remote nodes via gRPC `GetShardStats` concurrently.
+/// Local shards are read directly from the ShardManager.
+/// Returns a map of (index_name, shard_id) → doc_count.
+async fn collect_shard_doc_counts(state: &AppState) -> HashMap<(String, u32), u64> {
+    let mut counts: HashMap<(String, u32), u64> = HashMap::new();
+
+    // Local shards
+    for (key, engine) in state.shard_manager.all_shards() {
+        counts.insert((key.index.clone(), key.shard_id), engine.doc_count());
+    }
+
+    // Remote nodes — fan out concurrently
+    let cs = state.cluster_manager.get_state();
+    let mut handles = Vec::new();
+    for node in cs.nodes.values() {
+        if node.id == state.local_node_id {
+            continue;
+        }
+        let client = state.transport_client.clone();
+        let node = node.clone();
+        handles.push(tokio::spawn(async move {
+            client.get_shard_stats(&node).await
+        }));
+    }
+    for handle in handles {
+        if let Ok(Ok(remote_counts)) = handle.await {
+            counts.extend(remote_counts);
+        }
+    }
+
+    counts
+}
+
+/// Local-only doc count lookup: returns doc count string or "-" for remote shards.
+fn local_doc_count(state: &AppState, index: &str, shard_id: u32) -> String {
+    state
+        .shard_manager
+        .get_shard(index, shard_id)
+        .map(|e| e.doc_count().to_string())
+        .unwrap_or_else(|| "-".into())
 }
 
 fn text_response(body: String) -> Response {
@@ -67,8 +118,16 @@ pub async fn cat_nodes(State(state): State<AppState>, params: Query<CatParams>) 
 }
 
 /// GET /_cat/shards — tabular shard listing
+/// By default, fans out to all nodes to collect real doc counts.
+/// Pass `?local` to only show counts for shards on this node.
 pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>) -> Response {
     let cs = state.cluster_manager.get_state();
+    let local_only = wants_local(&params);
+    let doc_counts = if local_only {
+        None
+    } else {
+        Some(collect_shard_doc_counts(&state).await)
+    };
 
     let mut out = String::new();
     if wants_headers(&params) {
@@ -101,12 +160,13 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
                 "UNASSIGNED"
             };
 
-            // If this shard is local, grab doc count from the engine
-            let docs = state
-                .shard_manager
-                .get_shard(idx_name, shard_id)
-                .map(|e| e.doc_count().to_string())
-                .unwrap_or_else(|| "-".into());
+            let docs = match &doc_counts {
+                Some(m) => m
+                    .get(&(idx_name.clone(), shard_id))
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "0".into()),
+                None => local_doc_count(&state, idx_name, shard_id),
+            };
 
             writeln!(
                 out,
@@ -127,11 +187,13 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
                 } else {
                     "UNASSIGNED"
                 };
-                let replica_docs = state
-                    .shard_manager
-                    .get_shard(idx_name, shard_id)
-                    .map(|e| e.doc_count().to_string())
-                    .unwrap_or_else(|| "-".into());
+                let replica_docs = match &doc_counts {
+                    Some(m) => m
+                        .get(&(idx_name.clone(), shard_id))
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "0".into()),
+                    None => local_doc_count(&state, idx_name, shard_id),
+                };
                 writeln!(
                     out,
                     "{:<25} {:<8} {:<10} {:<10} {:<10} {:<40}",
@@ -156,8 +218,17 @@ pub async fn cat_shards(State(state): State<AppState>, params: Query<CatParams>)
 }
 
 /// GET /_cat/indices — tabular index listing
+/// By default, fans out to all nodes to collect real doc counts.
+/// Pass `?local` to only sum counts from local shards.
 pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>) -> Response {
     let cs = state.cluster_manager.get_state();
+    let local_only = wants_local(&params);
+    let doc_counts = if local_only {
+        None
+    } else {
+        Some(collect_shard_doc_counts(&state).await)
+    };
+
     let health_fn = |idx_name: &str| -> &'static str {
         let meta = match cs.indices.get(idx_name) {
             Some(m) => m,
@@ -199,16 +270,20 @@ pub async fn cat_indices(State(state): State<AppState>, params: Query<CatParams>
         let meta = &cs.indices[idx_name];
         let health = health_fn(idx_name);
 
-        // Sum doc counts from local shards; remote shards show as 0 here
-        let total_docs: u64 = (0..meta.number_of_shards)
-            .map(|sid| {
-                state
-                    .shard_manager
-                    .get_shard(idx_name, sid)
-                    .map(|e| e.doc_count())
-                    .unwrap_or(0)
-            })
-            .sum();
+        let total_docs: u64 = match &doc_counts {
+            Some(m) => (0..meta.number_of_shards)
+                .map(|sid| m.get(&(idx_name.clone(), sid)).copied().unwrap_or(0))
+                .sum(),
+            None => (0..meta.number_of_shards)
+                .map(|sid| {
+                    state
+                        .shard_manager
+                        .get_shard(idx_name, sid)
+                        .map(|e| e.doc_count())
+                        .unwrap_or(0)
+                })
+                .sum(),
+        };
 
         writeln!(
             out,
@@ -249,4 +324,52 @@ pub async fn cat_master(State(state): State<AppState>, params: Query<CatParams>)
     }
 
     text_response(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wants_headers_returns_true_when_v_present() {
+        let params = CatParams {
+            v: Some(String::new()),
+            local: None,
+        };
+        assert!(wants_headers(&params));
+    }
+
+    #[test]
+    fn wants_headers_returns_false_when_v_absent() {
+        let params = CatParams {
+            v: None,
+            local: None,
+        };
+        assert!(!wants_headers(&params));
+    }
+
+    #[test]
+    fn wants_local_returns_true_when_local_present() {
+        let params = CatParams {
+            v: None,
+            local: Some(String::new()),
+        };
+        assert!(wants_local(&params));
+    }
+
+    #[test]
+    fn wants_local_returns_false_when_local_absent() {
+        let params = CatParams {
+            v: None,
+            local: None,
+        };
+        assert!(!wants_local(&params));
+    }
+
+    #[test]
+    fn cat_params_default_has_no_local() {
+        let params = CatParams::default();
+        assert!(params.v.is_none());
+        assert!(params.local.is_none());
+    }
 }
